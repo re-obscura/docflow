@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { readFile, unlink } from 'fs/promises';
 import path from 'path';
 import { isValidToken, sanitizeString, requireAdmin } from '@/lib/security';
+import { logAudit } from '@/lib/audit';
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
 
@@ -12,6 +13,7 @@ interface DocRow {
     filename: string;
     original_name: string;
     file_type: string;
+    status: string;
 }
 
 export async function GET(
@@ -78,12 +80,19 @@ export async function DELETE(
             return NextResponse.json({ error: 'Document not found' }, { status: 404 });
         }
 
+        // Clients can only delete pending documents; admins can delete any
+        const isAdmin = requireAdmin(request.headers.get('authorization'));
+        if (!isAdmin && doc.status !== 'pending') {
+            return NextResponse.json({ error: 'Можно удалить только документы со статусом «На проверке»' }, { status: 403 });
+        }
+
         try {
             const safeFilename = path.basename(doc.filename);
             await unlink(path.join(UPLOAD_DIR, String(client.id), safeFilename));
         } catch { /* file may not exist */ }
 
         db.prepare('DELETE FROM documents WHERE id = ?').run(Number(id));
+        logAudit(client.id, isAdmin ? 'Администратор' : 'Клиент', isAdmin ? 'admin' : 'employee', 'Удалён документ', 'document', Number(id), doc.original_name || '');
         return NextResponse.json({ success: true });
     } catch {
         return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 });
@@ -125,6 +134,7 @@ export async function PATCH(
     `).run(status, status_comment, Number(id), client.id);
 
         const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(Number(id));
+        logAudit(client.id, 'Администратор', 'admin', `Документ ${status === 'accepted' ? 'принят' : status === 'rejected' ? 'отклонён' : 'возвращён на проверку'}`, 'document', Number(id), status_comment);
         return NextResponse.json(doc);
     } catch {
         return NextResponse.json({ error: 'Failed to update document status' }, { status: 500 });

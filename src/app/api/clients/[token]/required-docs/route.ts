@@ -17,7 +17,13 @@ export async function GET(
         if (!client) {
             return NextResponse.json({ error: 'Client not found' }, { status: 404 });
         }
-        const docs = db.prepare('SELECT * FROM required_docs WHERE client_id = ? ORDER BY id ASC').all(client.id);
+        const objectId = request.nextUrl.searchParams.get('object_id');
+        let docs;
+        if (objectId) {
+            docs = db.prepare('SELECT * FROM required_docs WHERE client_id = ? AND object_id = ? ORDER BY id ASC').all(client.id, objectId);
+        } else {
+            docs = db.prepare('SELECT * FROM required_docs WHERE client_id = ? ORDER BY id ASC').all(client.id);
+        }
         return NextResponse.json(docs);
     } catch {
         return NextResponse.json({ error: 'Failed to fetch required docs' }, { status: 500 });
@@ -58,9 +64,11 @@ export async function POST(
             return NextResponse.json({ error: 'Client not found' }, { status: 404 });
         }
 
+        const objectId = body.object_id ? Number(body.object_id) : null;
+
         const result = db.prepare(
-            `INSERT INTO required_docs (client_id, doc_name, description) VALUES (?, ?, ?)`
-        ).run(client.id, doc_name, description);
+            `INSERT INTO required_docs (client_id, object_id, doc_name, description) VALUES (?, ?, ?, ?)`
+        ).run(client.id, objectId, doc_name, description);
 
         const doc = db.prepare('SELECT * FROM required_docs WHERE id = ?').get(result.lastInsertRowid);
         return NextResponse.json(doc, { status: 201 });

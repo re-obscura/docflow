@@ -134,3 +134,18 @@ export function requireAdmin(authHeader: string | null): boolean {
     const token = authHeader.replace(/^Bearer\s+/i, '');
     return validateSession(token);
 }
+
+// Password hashing with bcrypt
+import { hashSync, compareSync } from 'bcryptjs';
+
+export function hashPassword(password: string): string {
+    return hashSync(password, 10);
+}
+
+export function verifyPassword(password: string, hash: string): boolean {
+    // Handle legacy plain-text passwords: if hash doesn't start with $2, it's plain text
+    if (!hash.startsWith('$2')) {
+        return password === hash;
+    }
+    return compareSync(password, hash);
+}

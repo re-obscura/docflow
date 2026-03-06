@@ -2,636 +2,732 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
-
-interface Client {
-    id: number; token: string;
-    company_name: string; short_name: string; legal_form: string;
-    inn: string; kpp: string; ogrn: string; okpo: string; okved: string;
-    registration_date: string;
-    legal_address: string; actual_address: string; postal_address: string;
-    bank_name: string; bank_account: string; corr_account: string; bik: string;
-    director_name: string; director_title: string; acts_on_basis: string;
-    contact_person: string; phone: string; email: string; fax: string; website: string;
-    tax_system: string; sro_name: string; sro_number: string;
-    object_name: string; object_address: string; object_purpose: string;
-    tech_economic_indicators: string; construction_type: string;
-    financing_info: string; buildings_info: string; cost_justification: string;
-    created_at: string;
-}
-
-interface Document {
-    id: number; client_id: number; filename: string; original_name: string;
-    file_type: string; file_size: number; category: string; status: string;
-    status_comment: string; uploaded_at: string; reviewed_at: string;
-}
-
-interface RequiredDoc {
-    id: number; client_id: number; doc_name: string; description: string;
-}
-
-interface Message {
-    id: number; client_id: number; sender: string; text: string; created_at: string;
-}
-
-function formatSize(bytes: number): string {
-    if (bytes < 1024) return bytes + ' Б';
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' КБ';
-    return (bytes / 1048576).toFixed(1) + ' МБ';
-}
-
-function formatDate(dateStr: string): string {
-    const d = new Date(dateStr + 'Z');
-    return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
-
-function getFileIcon(type: string): { label: string; cls: string } {
-    if (type.includes('pdf')) return { label: 'PDF', cls: 'pdf' };
-    if (type.includes('word') || type.includes('doc')) return { label: 'DOC', cls: 'doc' };
-    if (type.includes('sheet') || type.includes('xls')) return { label: 'XLS', cls: 'xls' };
-    if (type.includes('image')) return { label: 'IMG', cls: 'img' };
-    return { label: 'FILE', cls: 'other' };
-}
-
-function statusLabel(s: string) {
-    if (s === 'pending') return 'На проверке';
-    if (s === 'accepted') return 'Принят';
-    return 'Отклонён';
-}
-
-function Hint({ text }: { text: string }) {
-    return <span style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)', fontWeight: 400, marginTop: 2, lineHeight: 1.4 }}>{text}</span>;
-}
+import type { Client, Employee, ObjectItem, Document, RequiredDoc, Message } from '@/lib/types';
+import { formatSize, formatDate, getFileIcon, statusLabel, isImageType, validateINN, validateKPP, validateOGRN, validateBIK, validateAccount } from '@/lib/types';
 
 export default function PortalPage() {
     const params = useParams();
     const token = params.token as string;
 
+    // Auth state
+    const [authChecked, setAuthChecked] = useState(false);
+    const [currentEmployee, setCurrentEmployee] = useState<{ id: number; full_name: string } | null>(null);
+    const [empList, setEmpList] = useState<Employee[]>([]);
+    const [loginEmpId, setLoginEmpId] = useState<string>('');
+    const [loginPassword, setLoginPassword] = useState('');
+    const [loginError, setLoginError] = useState('');
+    const [companyName, setCompanyName] = useState('');
+    const [creatingFirst, setCreatingFirst] = useState(false);
+    const [firstEmpName, setFirstEmpName] = useState('');
+    const [firstEmpPassword, setFirstEmpPassword] = useState('');
+
     const [client, setClient] = useState<Client | null>(null);
+    const [employees, setEmployees] = useState<Employee[]>([]);
+    const [objects, setObjects] = useState<ObjectItem[]>([]);
+    const [selectedObjectId, setSelectedObjectId] = useState<number | null>(null);
     const [documents, setDocuments] = useState<Document[]>([]);
     const [requiredDocs, setRequiredDocs] = useState<RequiredDoc[]>([]);
     const [messages, setMessages] = useState<Message[]>([]);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [savingObj, setSavingObj] = useState(false);
     const [uploading, setUploading] = useState<string | null>(null);
     const [toast, setToast] = useState<{ type: string; text: string } | null>(null);
     const [msgText, setMsgText] = useState('');
     const [activeTab, setActiveTab] = useState('info');
 
+    const [newEmpName, setNewEmpName] = useState('');
+    const [newEmpPosition, setNewEmpPosition] = useState('');
+    const [newEmpPhone, setNewEmpPhone] = useState('');
+    const [newEmpEmail, setNewEmpEmail] = useState('');
+    const [newEmpPassword, setNewEmpPassword] = useState('');
+    const [editingEmpId, setEditingEmpId] = useState<number | null>(null);
+    const [editEmp, setEditEmp] = useState<Partial<Employee & { password: string }>>({});
+
+    const [showNewObjModal, setShowNewObjModal] = useState(false);
+    const [newObjName, setNewObjName] = useState('');
+
     const chatEndRef = useRef<HTMLDivElement>(null);
     const fileInputRefs = useRef<{ [key: string]: HTMLInputElement | null }>({});
+    const [previewImage, setPreviewImage] = useState<string | null>(null);
+    const [chatDragOver, setChatDragOver] = useState(false);
+    const [initialClient, setInitialClient] = useState<string>('');
 
     const showToast = useCallback((type: string, text: string) => {
         setToast({ type, text });
         setTimeout(() => setToast(null), 3000);
     }, []);
 
+    const selectedObject = objects.find(o => o.id === selectedObjectId) || null;
+
+    // ===== AUTH: Check for stored session =====
+    useEffect(() => {
+        const stored = sessionStorage.getItem(`emp_${token}`);
+        if (stored) {
+            try { setCurrentEmployee(JSON.parse(stored)); } catch { /* ignore */ }
+        }
+        (async () => {
+            try {
+                const [empRes, cRes] = await Promise.all([
+                    fetch(`/api/clients/${token}/employees`),
+                    fetch(`/api/clients/${token}`),
+                ]);
+                if (empRes.ok) {
+                    const emps = await empRes.json();
+                    setEmpList(emps);
+                    if (emps.length > 0 && !loginEmpId) setLoginEmpId(String(emps[0].id));
+                }
+                if (cRes.ok) {
+                    const c = await cRes.json();
+                    setCompanyName(c.company_name || '');
+                }
+            } catch { /* ignore */ }
+            setAuthChecked(true);
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [token]);
+
+    const handleLogin = async () => {
+        if (!loginEmpId) return;
+        setLoginError('');
+        try {
+            const res = await fetch(`/api/clients/${token}/employees/auth`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ employee_id: Number(loginEmpId), password: loginPassword }),
+            });
+            const data = await res.json();
+            if (res.ok && data.success) {
+                const emp = { id: data.employee.id, full_name: data.employee.full_name };
+                sessionStorage.setItem(`emp_${token}`, JSON.stringify(emp));
+                setCurrentEmployee(emp);
+            } else {
+                setLoginError(data.error || 'Ошибка входа');
+            }
+        } catch { setLoginError('Ошибка соединения'); }
+    };
+
+    const handleCreateFirstEmployee = async () => {
+        if (!firstEmpName.trim()) { setLoginError('Введите ФИО'); return; }
+        setLoginError('');
+        try {
+            const res = await fetch(`/api/clients/${token}/employees`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ full_name: firstEmpName, password: firstEmpPassword }),
+            });
+            if (res.ok) {
+                const emp = await res.json();
+                const session = { id: emp.id, full_name: emp.full_name };
+                sessionStorage.setItem(`emp_${token}`, JSON.stringify(session));
+                setCurrentEmployee(session);
+            } else {
+                const data = await res.json();
+                setLoginError(data.error || 'Ошибка создания');
+            }
+        } catch { setLoginError('Ошибка соединения'); }
+    };
+
+    const handleLogout = () => {
+        sessionStorage.removeItem(`emp_${token}`);
+        setCurrentEmployee(null);
+    };
+
+    // ===== DATA FETCHING =====
     const fetchData = useCallback(async () => {
         try {
-            const [cRes, dRes, rRes, mRes] = await Promise.all([
+            const [cRes, empRes, objRes, mRes] = await Promise.all([
                 fetch(`/api/clients/${token}`),
-                fetch(`/api/clients/${token}/documents`),
-                fetch(`/api/clients/${token}/required-docs`),
+                fetch(`/api/clients/${token}/employees`),
+                fetch(`/api/clients/${token}/objects`),
                 fetch(`/api/clients/${token}/messages`),
             ]);
             if (!cRes.ok) throw new Error('Client not found');
-            setClient(await cRes.json());
-            setDocuments(await dRes.json());
-            setRequiredDocs(await rRes.json());
+            const clientData = await cRes.json();
+            setClient(clientData);
+            setInitialClient(JSON.stringify(clientData));
+            setEmployees(await empRes.json());
+            const objData: ObjectItem[] = await objRes.json();
+            setObjects(objData);
             setMessages(await mRes.json());
-        } catch {
-            setClient(null);
-        } finally {
-            setLoading(false);
-        }
+            if (objData.length > 0) {
+                setSelectedObjectId(prev => {
+                    if (prev && objData.some(o => o.id === prev)) return prev;
+                    return objData[0].id;
+                });
+            }
+        } catch { setClient(null); } finally { setLoading(false); }
     }, [token]);
 
-    useEffect(() => { fetchData(); }, [fetchData]);
+    const fetchObjectDocs = useCallback(async (objectId: number | null) => {
+        if (!objectId) return;
+        try {
+            const [dRes, rRes] = await Promise.all([
+                fetch(`/api/clients/${token}/documents?object_id=${objectId}`),
+                fetch(`/api/clients/${token}/required-docs?object_id=${objectId}`),
+            ]);
+            if (dRes.ok) setDocuments(await dRes.json());
+            if (rRes.ok) setRequiredDocs(await rRes.json());
+        } catch { /* ignore */ }
+    }, [token]);
+
+    useEffect(() => { if (currentEmployee) fetchData(); }, [currentEmployee, fetchData]);
+    useEffect(() => { fetchObjectDocs(selectedObjectId); }, [selectedObjectId, fetchObjectDocs]);
+
     useEffect(() => {
+        if (!currentEmployee) return;
         const interval = setInterval(async () => {
             try {
                 const [dRes, mRes] = await Promise.all([
-                    fetch(`/api/clients/${token}/documents`),
+                    selectedObjectId ? fetch(`/api/clients/${token}/documents?object_id=${selectedObjectId}`) : Promise.resolve(null),
                     fetch(`/api/clients/${token}/messages`),
                 ]);
-                if (dRes.ok) setDocuments(await dRes.json());
+                if (dRes?.ok) setDocuments(await dRes.json());
                 if (mRes.ok) setMessages(await mRes.json());
             } catch { /* ignore */ }
         }, 10000);
         return () => clearInterval(interval);
-    }, [token]);
+    }, [token, selectedObjectId, currentEmployee]);
 
-    useEffect(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+    useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
+    // ===== HANDLERS =====
     const handleSaveClient = async () => {
         if (!client) return;
         setSaving(true);
         try {
-            const res = await fetch(`/api/clients/${token}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(client),
-            });
+            const res = await fetch(`/api/clients/${token}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(client) });
             if (res.ok) {
-                setClient(await res.json());
+                const saved = await res.json();
+                setClient(saved);
+                setInitialClient(JSON.stringify(saved));
                 showToast('success', 'Данные сохранены');
             }
-        } catch {
-            showToast('error', 'Ошибка сохранения');
-        } finally {
-            setSaving(false);
-        }
+        } catch { showToast('error', 'Ошибка сохранения'); } finally { setSaving(false); }
+    };
+
+    const handleSaveObject = async () => {
+        if (!selectedObject) return;
+        setSavingObj(true);
+        try {
+            const res = await fetch(`/api/clients/${token}/objects/${selectedObject.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(selectedObject) });
+            if (res.ok) { const updated = await res.json(); setObjects(prev => prev.map(o => o.id === updated.id ? updated : o)); showToast('success', 'Данные объекта сохранены'); }
+        } catch { showToast('error', 'Ошибка сохранения'); } finally { setSavingObj(false); }
+    };
+
+    const updateObject = (field: keyof ObjectItem, value: string) => {
+        setObjects(prev => prev.map(o => o.id === selectedObjectId ? { ...o, [field]: value } : o));
+    };
+
+    const handleCreateObject = async () => {
+        if (!newObjName.trim()) return;
+        try {
+            const res = await fetch(`/api/clients/${token}/objects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ object_name: newObjName }) });
+            if (res.ok) { const obj = await res.json(); setObjects(prev => [...prev, obj]); setSelectedObjectId(obj.id); setNewObjName(''); setShowNewObjModal(false); showToast('success', 'Объект создан'); }
+        } catch { showToast('error', 'Ошибка создания объекта'); }
+    };
+
+    const handleDeleteObject = async (id: number) => {
+        if (!confirm('Удалить объект и все связанные документы?')) return;
+        try {
+            const res = await fetch(`/api/clients/${token}/objects/${id}`, { method: 'DELETE' });
+            if (res.ok) {
+                setObjects(prev => { const next = prev.filter(o => o.id !== id); if (selectedObjectId === id && next.length > 0) setSelectedObjectId(next[0].id); else if (next.length === 0) setSelectedObjectId(null); return next; });
+                showToast('success', 'Объект удалён');
+            }
+        } catch { showToast('error', 'Ошибка удаления'); }
+    };
+
+    const handleAddEmployee = async () => {
+        if (!newEmpName.trim()) return;
+        try {
+            const res = await fetch(`/api/clients/${token}/employees`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ full_name: newEmpName, position: newEmpPosition, phone: newEmpPhone, email: newEmpEmail, password: newEmpPassword }) });
+            if (res.ok) { const emp = await res.json(); setEmployees(prev => [...prev, emp]); setNewEmpName(''); setNewEmpPosition(''); setNewEmpPhone(''); setNewEmpEmail(''); setNewEmpPassword(''); showToast('success', 'Сотрудник добавлен'); }
+        } catch { showToast('error', 'Ошибка добавления'); }
+    };
+
+    const handleUpdateEmployee = async (id: number) => {
+        try {
+            const res = await fetch(`/api/clients/${token}/employees/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(editEmp) });
+            if (res.ok) { const updated = await res.json(); setEmployees(prev => prev.map(e => e.id === id ? updated : e)); setEditingEmpId(null); showToast('success', 'Данные обновлены'); }
+        } catch { showToast('error', 'Ошибка обновления'); }
+    };
+
+    const handleDeleteEmployee = async (id: number) => {
+        if (!confirm('Удалить сотрудника?')) return;
+        try {
+            const res = await fetch(`/api/clients/${token}/employees/${id}`, { method: 'DELETE' });
+            if (res.ok) { setEmployees(prev => prev.filter(e => e.id !== id)); showToast('success', 'Сотрудник удалён'); }
+        } catch { showToast('error', 'Ошибка удаления'); }
     };
 
     const handleUpload = async (file: File, category: string) => {
+        if (!selectedObjectId || !currentEmployee) return;
         setUploading(category);
         try {
             const formData = new FormData();
-            formData.append('file', file);
-            formData.append('category', category);
+            formData.append('file', file); formData.append('category', category);
+            formData.append('object_id', String(selectedObjectId));
+            formData.append('uploaded_by_employee_id', String(currentEmployee.id));
+            formData.append('uploaded_by_name', currentEmployee.full_name);
             const res = await fetch(`/api/clients/${token}/documents`, { method: 'POST', body: formData });
-            if (res.ok) {
-                const newDoc = await res.json();
-                setDocuments(prev => [newDoc, ...prev]);
-                showToast('success', 'Файл загружен');
-            } else {
-                const err = await res.json();
-                showToast('error', err.error || 'Ошибка загрузки');
-            }
-        } catch {
-            showToast('error', 'Ошибка загрузки');
-        } finally {
-            setUploading(null);
-        }
+            if (res.ok) { const newDoc = await res.json(); setDocuments(prev => [newDoc, ...prev]); showToast('success', 'Файл загружен'); }
+            else { const err = await res.json(); showToast('error', err.error || 'Ошибка загрузки'); }
+        } catch { showToast('error', 'Ошибка загрузки'); } finally { setUploading(null); }
     };
 
-    const handleDropUpload = (e: React.DragEvent, category: string) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const file = e.dataTransfer.files[0];
-        if (file) handleUpload(file, category);
-    };
+    const handleDropUpload = (e: React.DragEvent, category: string) => { e.preventDefault(); e.stopPropagation(); const file = e.dataTransfer.files[0]; if (file) handleUpload(file, category); };
 
     const handleDeleteDoc = async (docId: number) => {
         try {
             const res = await fetch(`/api/clients/${token}/documents/${docId}`, { method: 'DELETE' });
-            if (res.ok) {
-                setDocuments(prev => prev.filter(d => d.id !== docId));
-                showToast('success', 'Документ удалён');
-            }
-        } catch {
-            showToast('error', 'Ошибка удаления');
-        }
+            if (res.ok) { setDocuments(prev => prev.filter(d => d.id !== docId)); showToast('success', 'Документ удалён'); }
+            else { const err = await res.json(); showToast('error', err.error || 'Ошибка удаления'); }
+        } catch { showToast('error', 'Ошибка удаления'); }
     };
 
-    const handleSendMessage = async () => {
-        if (!msgText.trim()) return;
+    const handleSendMessage = async (file?: File) => {
+        if (!currentEmployee) return;
+        if (!msgText.trim() && !file) return;
         try {
-            const res = await fetch(`/api/clients/${token}/messages`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: msgText, sender: 'client' }),
-            });
-            if (res.ok) {
-                const msg = await res.json();
-                setMessages(prev => [...prev, msg]);
-                setMsgText('');
-            }
-        } catch {
-            showToast('error', 'Ошибка отправки');
+            const formData = new FormData();
+            formData.append('text', msgText); formData.append('sender', 'client');
+            formData.append('sender_name', currentEmployee.full_name);
+            if (file) formData.append('file', file);
+            const res = await fetch(`/api/clients/${token}/messages`, { method: 'POST', body: formData });
+            if (res.ok) { const msg = await res.json(); setMessages(prev => [...prev, msg]); setMsgText(''); }
+            else { const err = await res.json(); showToast('error', err.error || 'Ошибка отправки'); }
+        } catch { showToast('error', 'Ошибка отправки'); }
+    };
+
+    const u = (field: keyof Client, value: string) => { setClient(prev => prev ? { ...prev, [field]: value } : prev); };
+
+    // ===== RENDERING =====
+
+    if (!authChecked) {
+        return (
+            <div className="auth-screen">
+                <div className="auth-box" style={{ textAlign: 'center' }}>
+                    <div className="spinner" style={{ margin: '0 auto' }} />
+                    <p style={{ marginTop: 12, color: 'var(--text-muted)', fontSize: 13 }}>Загрузка...</p>
+                </div>
+            </div>
+        );
+    }
+
+    if (!currentEmployee) {
+        if (empList.length === 0) {
+            return (
+                <div className="auth-screen">
+                    <div className="auth-box">
+                        <h2>DocFlow</h2>
+                        <p className="auth-subtitle">{companyName || 'Портал клиента'}</p>
+                        {!creatingFirst ? (
+                            <>
+                                <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 16, lineHeight: 1.5 }}>
+                                    Для начала работы создайте аккаунт первого сотрудника. После этого вы сможете добавлять других участников.
+                                </p>
+                                <button className="btn btn-primary" style={{ width: '100%' }} onClick={() => setCreatingFirst(true)}>Создать аккаунт</button>
+                            </>
+                        ) : (
+                            <>
+                                <div className="form-group" style={{ marginBottom: 12 }}>
+                                    <label>ФИО</label>
+                                    <input value={firstEmpName} onChange={e => setFirstEmpName(e.target.value)} placeholder="Укажите полное имя, например: Петров Алексей Сергеевич" autoFocus />
+                                    <span className="hint">Будет использоваться для входа и в истории действий</span>
+                                </div>
+                                <div className="form-group" style={{ marginBottom: 12 }}>
+                                    <label>Пароль</label>
+                                    <input type="password" value={firstEmpPassword} onChange={e => setFirstEmpPassword(e.target.value)} placeholder="Необязательно — можно оставить пустым" />
+                                    <span className="hint">Если пароль не задан, вход будет по выбору имени без пароля</span>
+                                </div>
+                                {loginError && <p className="field-error" style={{ marginBottom: 8 }}>{loginError}</p>}
+                                <button className="btn btn-primary" style={{ width: '100%' }} onClick={handleCreateFirstEmployee}>Создать и войти</button>
+                            </>
+                        )}
+                    </div>
+                </div>
+            );
         }
-    };
 
-    const u = (field: keyof Client, value: string) => {
-        setClient(prev => prev ? { ...prev, [field]: value } : prev);
-    };
-
-    if (loading) {
         return (
-            <div className="page-wrapper" style={{ textAlign: 'center', paddingTop: '100px' }}>
-                <div className="loader" style={{ width: 32, height: 32 }}></div>
-                <p style={{ marginTop: 16, color: 'var(--text-muted)' }}>Загрузка...</p>
+            <div className="auth-screen">
+                <div className="auth-box">
+                    <h2>DocFlow</h2>
+                    <p className="auth-subtitle">{companyName || 'Портал клиента'}</p>
+                    <div className="form-group" style={{ marginBottom: 12 }}>
+                        <label>Сотрудник</label>
+                        <select value={loginEmpId} onChange={e => setLoginEmpId(e.target.value)}>
+                            {empList.map(emp => (
+                                <option key={emp.id} value={emp.id}>{emp.full_name || `#${emp.id}`}</option>
+                            ))}
+                        </select>
+                        <span className="hint">Выберите своё имя из списка</span>
+                    </div>
+                    <div className="form-group" style={{ marginBottom: 12 }}>
+                        <label>Пароль</label>
+                        <input type="password" value={loginPassword} onChange={e => setLoginPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleLogin()} placeholder="Введите пароль, если он был задан" />
+                    </div>
+                    {loginError && <p className="field-error" style={{ marginBottom: 8 }}>{loginError}</p>}
+                    <button className="btn btn-primary" style={{ width: '100%' }} onClick={handleLogin}>Войти</button>
+                </div>
             </div>
         );
     }
 
-    if (!client) {
-        return (
-            <div className="page-wrapper" style={{ textAlign: 'center', paddingTop: '100px' }}>
-                <h2>Ссылка недействительна</h2>
-                <p style={{ color: 'var(--text-secondary)', marginTop: 8 }}>Проверьте правильность ссылки или свяжитесь с менеджером.</p>
-            </div>
-        );
-    }
+    if (loading) return <div className="loading-center"><div className="spinner" /><span>Загрузка данных...</span></div>;
+    if (!client) return <div className="loading-center"><span style={{ color: 'var(--text)' }}>Ссылка недействительна. Проверьте правильность или свяжитесь с менеджером.</span></div>;
 
     const getDocsForCategory = (category: string) => documents.filter(d => d.category === category);
+    const hasUnsavedChanges = client ? JSON.stringify(client) !== initialClient : false;
 
     return (
         <div className="page-wrapper">
-            <div className="page-header">
-                <h1>DocFlow — Личный кабинет</h1>
-                <p>Заполните все разделы и загрузите необходимые документы. Если что-то непонятно — напишите менеджеру в разделе «Сообщения».</p>
+            {/* HEADER */}
+            <div className="app-header">
+                <div className="app-header-left">
+                    <div className="app-logo">DF</div>
+                    <div className="app-header-text">
+                        <h1>{client.company_name || 'Личный кабинет'}</h1>
+                        <p>{currentEmployee.full_name}</p>
+                    </div>
+                </div>
+                <div className="app-header-actions">
+                    <button className="btn btn-ghost btn-sm" onClick={handleLogout}>Выйти</button>
+                </div>
             </div>
 
+            {/* TABS */}
             <div className="tabs">
-                <button className={`tab ${activeTab === 'info' ? 'active' : ''}`} onClick={() => setActiveTab('info')}>Данные</button>
+                <button className={`tab ${activeTab === 'info' ? 'active' : ''}`} onClick={() => setActiveTab('info')}>Реквизиты</button>
+                <button className={`tab ${activeTab === 'employees' ? 'active' : ''}`} onClick={() => setActiveTab('employees')}>Сотрудники</button>
+                <button className={`tab ${activeTab === 'object' ? 'active' : ''}`} onClick={() => setActiveTab('object')}>Объекты</button>
                 <button className={`tab ${activeTab === 'docs' ? 'active' : ''}`} onClick={() => setActiveTab('docs')}>Документы</button>
                 <button className={`tab ${activeTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveTab('chat')}>Сообщения</button>
             </div>
 
+            {/* OBJECT SELECTOR for object/docs tabs */}
+            {(activeTab === 'object' || activeTab === 'docs') && (
+                <div className="obj-list">
+                    {objects.map(o => {
+                        const objDocs = documents.filter(d => d.object_id === o.id);
+                        const accepted = objDocs.filter(d => d.status === 'accepted').length;
+                        const total = objDocs.length;
+                        const pct = total > 0 ? Math.round((accepted / total) * 100) : 0;
+                        return (
+                            <div key={o.id} className={`obj-item ${o.id === selectedObjectId ? 'active' : ''}`} onClick={() => setSelectedObjectId(o.id)}>
+                                <div className="obj-item-name">{o.object_name || `Объект ${o.id}`}</div>
+                                <div className="obj-item-addr">{o.object_address || 'Адрес не указан'}</div>
+                                {total > 0 && (
+                                    <div style={{ marginTop: 8 }}>
+                                        <div className="progress-bar"><div className={`progress-fill ${pct === 100 ? 'complete' : ''}`} style={{ width: `${pct}%` }} /></div>
+                                        <div className="progress-label">{accepted} из {total} принято</div>
+                                    </div>
+                                )}
+                                {objects.length > 1 && (
+                                    <button className="btn btn-danger btn-xs" style={{ position: 'absolute', top: 6, right: 6 }} onClick={e => { e.stopPropagation(); handleDeleteObject(o.id); }}>Удалить</button>
+                                )}
+                            </div>
+                        );
+                    })}
+                    <div className="obj-item-add" onClick={() => setShowNewObjModal(true)}>
+                        <span className="plus">+</span>
+                        <span>Добавить объект</span>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== REQUISITES TAB ===== */}
             {activeTab === 'info' && (
                 <>
-                    {/* ===== 1. Основные реквизиты ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Основные реквизиты</h2>
-                        </div>
-                        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
-                            Заполните данные организации в соответствии с учредительными документами и выпиской из ЕГРЮЛ/ЕГРИП.
-                        </p>
+                    <div className="card">
+                        <div className="card-title">Основные сведения об организации</div>
                         <div className="form-grid">
-                            <div className="form-group full-width">
-                                <label>Полное наименование организации</label>
-                                <Hint text='Как в ЕГРЮЛ. Например: Общество с ограниченной ответственностью «СтройИнвест»' />
-                                <input value={client.company_name} onChange={e => u('company_name', e.target.value)} placeholder='Общество с ограниченной ответственностью «Пример»' />
-                            </div>
-                            <div className="form-group">
-                                <label>Сокращённое наименование</label>
-                                <Hint text='Краткое название. Например: ООО «СтройИнвест»' />
-                                <input value={client.short_name} onChange={e => u('short_name', e.target.value)} placeholder='ООО «Пример»' />
-                            </div>
-                            <div className="form-group">
-                                <label>Организационно-правовая форма</label>
-                                <Hint text="ООО, АО, ПАО, ИП, ГУП, МУП и т.д." />
-                                <input value={client.legal_form} onChange={e => u('legal_form', e.target.value)} placeholder="ООО" />
-                            </div>
-                            <div className="form-group">
-                                <label>ИНН</label>
-                                <Hint text="10 цифр для юрлица, 12 для ИП" />
-                                <input value={client.inn} onChange={e => u('inn', e.target.value)} placeholder="1234567890" />
-                            </div>
-                            <div className="form-group">
-                                <label>КПП</label>
-                                <Hint text="9 цифр, код причины постановки на учёт" />
-                                <input value={client.kpp} onChange={e => u('kpp', e.target.value)} placeholder="123456789" />
-                            </div>
-                            <div className="form-group">
-                                <label>ОГРН / ОГРНИП</label>
-                                <Hint text="13 цифр для юрлица (ОГРН), 15 для ИП (ОГРНИП)" />
-                                <input value={client.ogrn} onChange={e => u('ogrn', e.target.value)} placeholder="1234567890123" />
-                            </div>
-                            <div className="form-group">
-                                <label>ОКПО</label>
-                                <Hint text="Код по общероссийскому классификатору предприятий, 8 или 10 цифр" />
-                                <input value={client.okpo} onChange={e => u('okpo', e.target.value)} placeholder="12345678" />
-                            </div>
-                            <div className="form-group">
-                                <label>ОКВЭД (основной)</label>
-                                <Hint text="Основной код вида экономической деятельности, например: 41.20" />
-                                <input value={client.okved} onChange={e => u('okved', e.target.value)} placeholder="41.20" />
-                            </div>
-                            <div className="form-group">
-                                <label>Дата регистрации</label>
-                                <Hint text="Дата государственной регистрации юрлица" />
-                                <input value={client.registration_date} onChange={e => u('registration_date', e.target.value)} placeholder="01.01.2020" />
-                            </div>
+                            <div className="form-group full-width"><label>Полное наименование</label><input value={client.company_name} onChange={e => u('company_name', e.target.value)} placeholder="Общество с ограниченной ответственностью «Название»" /><span className="hint">Укажите полное наименование, включая организационно-правовую форму</span></div>
+                            <div className="form-group"><label>Сокращённое наименование</label><input value={client.short_name} onChange={e => u('short_name', e.target.value)} placeholder='ООО «Название»' /></div>
+                            <div className="form-group"><label>Организационно-правовая форма</label><input value={client.legal_form} onChange={e => u('legal_form', e.target.value)} placeholder="ООО, АО, ИП..." /></div>
+                            <div className="form-group"><label>ИНН</label><input value={client.inn} onChange={e => u('inn', e.target.value)} placeholder="10 или 12 цифр" className={client.inn && !validateINN(client.inn) ? 'input-error' : ''} />{client.inn && !validateINN(client.inn) && <span className="field-error">ИНН должен содержать 10 или 12 цифр</span>}</div>
+                            <div className="form-group"><label>КПП</label><input value={client.kpp} onChange={e => u('kpp', e.target.value)} placeholder="9 цифр" className={client.kpp && !validateKPP(client.kpp) ? 'input-error' : ''} />{client.kpp && !validateKPP(client.kpp) && <span className="field-error">КПП — 9 цифр</span>}</div>
+                            <div className="form-group"><label>ОГРН / ОГРНИП</label><input value={client.ogrn} onChange={e => u('ogrn', e.target.value)} placeholder="13 цифр для ООО, 15 для ИП" className={client.ogrn && !validateOGRN(client.ogrn) ? 'input-error' : ''} />{client.ogrn && !validateOGRN(client.ogrn) && <span className="field-error">ОГРН — 13 или 15 цифр</span>}</div>
+                            <div className="form-group"><label>ОКПО</label><input value={client.okpo} onChange={e => u('okpo', e.target.value)} placeholder="8 или 10 цифр" /></div>
+                            <div className="form-group"><label>ОКВЭД</label><input value={client.okved} onChange={e => u('okved', e.target.value)} placeholder="Основной вид деятельности" /></div>
+                            <div className="form-group"><label>Дата регистрации</label><input value={client.registration_date} onChange={e => u('registration_date', e.target.value)} placeholder="дд.мм.гггг" /></div>
                         </div>
                     </div>
 
-                    {/* ===== 2. Адреса ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Адреса</h2>
-                        </div>
+                    <div className="card">
+                        <div className="card-title">Адреса</div>
                         <div className="form-grid">
-                            <div className="form-group full-width">
-                                <label>Юридический адрес</label>
-                                <Hint text="Адрес регистрации по ЕГРЮЛ с индексом" />
-                                <input value={client.legal_address} onChange={e => u('legal_address', e.target.value)} placeholder="123456, г. Москва, ул. Строителей, д. 1, оф. 101" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Фактический адрес</label>
-                                <Hint text="Адрес, по которому фактически находится организация. Если совпадает с юридическим — укажите то же самое" />
-                                <input value={client.actual_address} onChange={e => u('actual_address', e.target.value)} placeholder="Если совпадает с юридическим — укажите то же самое" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Почтовый адрес</label>
-                                <Hint text="Адрес для корреспонденции, если отличается от юридического" />
-                                <input value={client.postal_address} onChange={e => u('postal_address', e.target.value)} placeholder="Адрес для получения почтовой корреспонденции" />
-                            </div>
+                            <div className="form-group full-width"><label>Юридический адрес</label><input value={client.legal_address} onChange={e => u('legal_address', e.target.value)} placeholder="Индекс, город, улица, дом, офис" /><span className="hint">Адрес из учредительных документов</span></div>
+                            <div className="form-group full-width"><label>Фактический адрес</label><input value={client.actual_address} onChange={e => u('actual_address', e.target.value)} placeholder="Заполните, если отличается от юридического" /></div>
+                            <div className="form-group full-width"><label>Почтовый адрес</label><input value={client.postal_address} onChange={e => u('postal_address', e.target.value)} placeholder="Адрес для получения корреспонденции" /></div>
                         </div>
                     </div>
 
-                    {/* ===== 3. Банковские реквизиты ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Банковские реквизиты</h2>
-                        </div>
-                        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
-                            Реквизиты расчётного счёта для составления договоров и выставления счетов.
-                        </p>
+                    <div className="card">
+                        <div className="card-title">Банковские реквизиты</div>
                         <div className="form-grid">
-                            <div className="form-group full-width">
-                                <label>Наименование банка</label>
-                                <Hint text='Полное название банка с указанием города. Например: ПАО «Сбербанк», г. Москва' />
-                                <input value={client.bank_name} onChange={e => u('bank_name', e.target.value)} placeholder='ПАО «Сбербанк», г. Москва' />
-                            </div>
-                            <div className="form-group">
-                                <label>Расчётный счёт</label>
-                                <Hint text="20 цифр, начинается с 40702 для юрлиц" />
-                                <input value={client.bank_account} onChange={e => u('bank_account', e.target.value)} placeholder="40702810000000000000" />
-                            </div>
-                            <div className="form-group">
-                                <label>Корреспондентский счёт</label>
-                                <Hint text="20 цифр, начинается с 30101" />
-                                <input value={client.corr_account} onChange={e => u('corr_account', e.target.value)} placeholder="30101810000000000000" />
-                            </div>
-                            <div className="form-group">
-                                <label>БИК</label>
-                                <Hint text="Банковский идентификационный код, 9 цифр" />
-                                <input value={client.bik} onChange={e => u('bik', e.target.value)} placeholder="044525225" />
-                            </div>
+                            <div className="form-group full-width"><label>Наименование банка</label><input value={client.bank_name} onChange={e => u('bank_name', e.target.value)} placeholder='Полное наименование, например: ПАО «Сбербанк»' /></div>
+                            <div className="form-group"><label>Расчётный счёт</label><input value={client.bank_account} onChange={e => u('bank_account', e.target.value)} placeholder="20 цифр" className={client.bank_account && !validateAccount(client.bank_account) ? 'input-error' : ''} />{client.bank_account && !validateAccount(client.bank_account) && <span className="field-error">Расчётный счёт — 20 цифр</span>}</div>
+                            <div className="form-group"><label>Корреспондентский счёт</label><input value={client.corr_account} onChange={e => u('corr_account', e.target.value)} placeholder="20 цифр" /></div>
+                            <div className="form-group"><label>БИК</label><input value={client.bik} onChange={e => u('bik', e.target.value)} placeholder="9 цифр" className={client.bik && !validateBIK(client.bik) ? 'input-error' : ''} />{client.bik && !validateBIK(client.bik) && <span className="field-error">БИК — 9 цифр</span>}</div>
                         </div>
                     </div>
 
-                    {/* ===== 4. Руководство ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Руководство</h2>
-                        </div>
+                    <div className="card">
+                        <div className="card-title">Руководство</div>
                         <div className="form-grid">
-                            <div className="form-group">
-                                <label>ФИО руководителя</label>
-                                <Hint text="ФИО генерального директора или ИП" />
-                                <input value={client.director_name} onChange={e => u('director_name', e.target.value)} placeholder="Иванов Иван Иванович" />
-                            </div>
-                            <div className="form-group">
-                                <label>Должность руководителя</label>
-                                <Hint text="Генеральный директор, Директор, Индивидуальный предприниматель" />
-                                <input value={client.director_title} onChange={e => u('director_title', e.target.value)} placeholder="Генеральный директор" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Действует на основании</label>
-                                <Hint text="Устав, Доверенность № и дата, Свидетельство о регистрации ИП" />
-                                <input value={client.acts_on_basis} onChange={e => u('acts_on_basis', e.target.value)} placeholder="Устав" />
-                            </div>
+                            <div className="form-group"><label>ФИО руководителя</label><input value={client.director_name} onChange={e => u('director_name', e.target.value)} placeholder="Фамилия Имя Отчество" /></div>
+                            <div className="form-group"><label>Должность</label><input value={client.director_title} onChange={e => u('director_title', e.target.value)} placeholder="Генеральный директор" /></div>
+                            <div className="form-group full-width"><label>Действует на основании</label><input value={client.acts_on_basis} onChange={e => u('acts_on_basis', e.target.value)} placeholder="Устав, Доверенность и т.д." /></div>
                         </div>
                     </div>
 
-                    {/* ===== 5. Контактные данные ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Контактные данные</h2>
-                        </div>
+                    <div className="card">
+                        <div className="card-title">Контактные данные</div>
                         <div className="form-grid">
-                            <div className="form-group">
-                                <label>Контактное лицо</label>
-                                <Hint text="ФИО ответственного за документооборот по проекту" />
-                                <input value={client.contact_person} onChange={e => u('contact_person', e.target.value)} placeholder="Петров Пётр Петрович" />
-                            </div>
-                            <div className="form-group">
-                                <label>Телефон</label>
-                                <input value={client.phone} onChange={e => u('phone', e.target.value)} placeholder="+7 (999) 123-45-67" />
-                            </div>
-                            <div className="form-group">
-                                <label>Email</label>
-                                <Hint text="Основной адрес электронной почты" />
-                                <input type="email" value={client.email} onChange={e => u('email', e.target.value)} placeholder="info@example.com" />
-                            </div>
-                            <div className="form-group">
-                                <label>Факс</label>
-                                <Hint text="Если есть факсимильная связь" />
-                                <input value={client.fax} onChange={e => u('fax', e.target.value)} placeholder="+7 (495) 123-45-67" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Сайт</label>
-                                <Hint text="Адрес официального сайта организации" />
-                                <input value={client.website} onChange={e => u('website', e.target.value)} placeholder="https://example.com" />
-                            </div>
+                            <div className="form-group"><label>Контактное лицо</label><input value={client.contact_person} onChange={e => u('contact_person', e.target.value)} placeholder="ФИО ответственного за документооборот" /></div>
+                            <div className="form-group"><label>Телефон</label><input value={client.phone} onChange={e => u('phone', e.target.value)} placeholder="+7 (___) ___-__-__" /></div>
+                            <div className="form-group"><label>Email</label><input value={client.email} onChange={e => u('email', e.target.value)} placeholder="example@company.ru" /></div>
+                            <div className="form-group"><label>Факс</label><input value={client.fax} onChange={e => u('fax', e.target.value)} placeholder="При наличии" /></div>
+                            <div className="form-group full-width"><label>Сайт</label><input value={client.website} onChange={e => u('website', e.target.value)} placeholder="https://company.ru" /></div>
                         </div>
                     </div>
 
-                    {/* ===== 6. Дополнительные сведения ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Дополнительные сведения</h2>
-                        </div>
+                    <div className="card">
+                        <div className="card-title">Дополнительные сведения</div>
                         <div className="form-grid">
-                            <div className="form-group">
-                                <label>Система налогообложения</label>
-                                <Hint text="ОСНО, УСН (6% или 15%), ЕНВД, ПСН" />
-                                <input value={client.tax_system} onChange={e => u('tax_system', e.target.value)} placeholder="ОСНО" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Наименование СРО</label>
-                                <Hint text="Саморегулируемая организация, в которой состоит компания (для строительных работ)" />
-                                <input value={client.sro_name} onChange={e => u('sro_name', e.target.value)} placeholder='Ассоциация «СРО Строителей»' />
-                            </div>
-                            <div className="form-group">
-                                <label>Номер допуска / свидетельства СРО</label>
-                                <Hint text="Регистрационный номер допуска к определённым видам работ" />
-                                <input value={client.sro_number} onChange={e => u('sro_number', e.target.value)} placeholder="СРО-С-123-45678901" />
-                            </div>
+                            <div className="form-group"><label>Система налогообложения</label><input value={client.tax_system} onChange={e => u('tax_system', e.target.value)} placeholder="ОСНО, УСН, ЕСХН..." /></div>
+                            <div className="form-group full-width"><label>Наименование СРО</label><input value={client.sro_name} onChange={e => u('sro_name', e.target.value)} placeholder="Полное наименование саморегулируемой организации" /><span className="hint">Заполняется при наличии членства в СРО</span></div>
+                            <div className="form-group"><label>Номер допуска СРО</label><input value={client.sro_number} onChange={e => u('sro_number', e.target.value)} placeholder="Номер свидетельства" /></div>
                         </div>
                     </div>
 
-                    {/* ===== 7. Обоснование сметной стоимости ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Обоснование особенностей определения сметной стоимости</h2>
-                        </div>
-                        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
-                            Укажите коэффициенты и условия, учитывающие особенности производства работ на вашем объекте.
-                        </p>
-                        <div className="form-group">
-                            <label>Коэффициенты, учитывающие условия производства работ</label>
-                            <Hint text="Стеснённость, вредность, высотность, зимнее удорожание, индексы-дефляторы. Например: К=1.15 за стеснённость (МДС 81-35.2004 п.4.7)" />
-                            <textarea
-                                value={client.cost_justification}
-                                onChange={e => u('cost_justification', e.target.value)}
-                                placeholder={"К=1.15 за стеснённость условий (МДС 81-35.2004 п.4.7)\nИндекс пересчёта в текущие цены — 8.34"}
-                                style={{ minHeight: 120 }}
-                            />
-                        </div>
-                    </div>
-
-                    {/* ===== 8. Сведения об объекте ===== */}
-                    <div className="card section-gap">
-                        <div className="card-header">
-                            <h2><span className="icon">|</span> Сведения об объекте</h2>
-                        </div>
-                        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
-                            Заполните информацию об объекте строительства в соответствии с проектной документацией.
-                        </p>
-                        <div className="form-grid">
-                            <div className="form-group full-width">
-                                <label>Наименование объекта</label>
-                                <Hint text="Полное название объекта строительства, как в проектной документации" />
-                                <input value={client.object_name} onChange={e => u('object_name', e.target.value)} placeholder={'Жилой комплекс «Солнечный»'} />
-                            </div>
-                            <div className="form-group">
-                                <label>Вид строительства</label>
-                                <Hint text="Новое строительство, реконструкция, капитальный ремонт, техническое перевооружение, снос" />
-                                <input value={client.construction_type} onChange={e => u('construction_type', e.target.value)} placeholder="Новое строительство" />
-                            </div>
-                            <div className="form-group">
-                                <label>Почтовый (строительный) адрес</label>
-                                <Hint text="Фактическое местоположение объекта строительства" />
-                                <input value={client.object_address} onChange={e => u('object_address', e.target.value)} placeholder="г. Москва, ул. Примерная, д. 1" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Сведения об источнике и размере финансирования</label>
-                                <Hint text="Источник (бюджет, частные инвестиции, кредит) и общий объём" />
-                                <textarea value={client.financing_info} onChange={e => u('financing_info', e.target.value)} placeholder="Федеральный бюджет, 500 млн руб." />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Сведения о функциональном назначении</label>
-                                <Hint text="Жильё, торговля, промышленность, социальный объект и т.п." />
-                                <textarea value={client.object_purpose} onChange={e => u('object_purpose', e.target.value)} placeholder="Многоквартирный жилой дом с нежилыми помещениями на первом этаже" />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Технико-экономические показатели (ТЭП)</label>
-                                <Hint text="Общая площадь, этажность, строительный объём, площадь застройки, количество квартир/помещений" />
-                                <textarea
-                                    value={client.tech_economic_indicators}
-                                    onChange={e => u('tech_economic_indicators', e.target.value)}
-                                    placeholder={"Общая площадь: 12 500 м²\nЭтажность: 16 этажей\nСтроительный объём: 45 000 м³"}
-                                    style={{ minHeight: 100 }}
-                                />
-                            </div>
-                            <div className="form-group full-width">
-                                <label>Сведения о зданиях и сооружениях, входящих в состав объекта</label>
-                                <Hint text="Все здания и сооружения: корпуса, паркинги, подстанции, инженерные сети" />
-                                <textarea
-                                    value={client.buildings_info}
-                                    onChange={e => u('buildings_info', e.target.value)}
-                                    placeholder={"1. Жилой дом — 16 этажей, 12 500 м²\n2. Подземный паркинг — 3 000 м²\n3. Трансформаторная подстанция"}
-                                    style={{ minHeight: 100 }}
-                                />
-                            </div>
-                        </div>
-                    </div>
-
-                    <button className="btn btn-primary" onClick={handleSaveClient} disabled={saving} style={{ marginTop: 8 }}>
-                        {saving ? <><span className="loader"></span> Сохранение...</> : 'Сохранить все данные'}
+                    <button className={`btn btn-primary ${hasUnsavedChanges ? 'btn-unsaved' : ''}`} onClick={handleSaveClient} disabled={saving} style={{ marginTop: 8 }}>
+                        {saving ? 'Сохранение...' : hasUnsavedChanges ? 'Сохранить изменения' : 'Сохранить реквизиты'}
                     </button>
                 </>
             )}
 
-            {activeTab === 'docs' && (
-                <>
-                    <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 20 }}>
-                        Загрузите каждый из требуемых документов. Нажмите на область загрузки или перетащите файл.
+            {/* ===== EMPLOYEES TAB ===== */}
+            {activeTab === 'employees' && (
+                <div className="card">
+                    <div className="card-title">Сотрудники компании</div>
+                    <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16, lineHeight: 1.5 }}>
+                        Каждый добавленный сотрудник может входить в портал под своим именем. Все загрузки и действия будут подписаны его именем.
                     </p>
 
-                    {requiredDocs.map(rd => {
-                        const catDocs = getDocsForCategory(rd.doc_name);
-                        const hasDoc = catDocs.length > 0;
-                        return (
-                            <div key={rd.id} className="card section-gap">
-                                <div className="card-header">
-                                    <h2><span className="icon">|</span> {rd.doc_name}</h2>
-                                    {hasDoc && <span className="badge badge-accepted">Загружен</span>}
+                    {employees.map(emp => (
+                        <div key={emp.id} className="emp-row">
+                            {editingEmpId === emp.id ? (
+                                <div style={{ flex: 1 }}>
+                                    <div className="form-grid">
+                                        <div className="form-group"><label>ФИО</label><input value={editEmp.full_name || ''} onChange={e => setEditEmp(p => ({ ...p, full_name: e.target.value }))} placeholder="Фамилия Имя Отчество" /></div>
+                                        <div className="form-group"><label>Должность</label><input value={editEmp.position || ''} onChange={e => setEditEmp(p => ({ ...p, position: e.target.value }))} placeholder="Инженер, Прораб..." /></div>
+                                        <div className="form-group"><label>Телефон</label><input value={editEmp.phone || ''} onChange={e => setEditEmp(p => ({ ...p, phone: e.target.value }))} placeholder="+7 (___) ___-__-__" /></div>
+                                        <div className="form-group"><label>Email</label><input value={editEmp.email || ''} onChange={e => setEditEmp(p => ({ ...p, email: e.target.value }))} placeholder="email@example.ru" /></div>
+                                        <div className="form-group"><label>Новый пароль</label><input type="password" value={editEmp.password || ''} onChange={e => setEditEmp(p => ({ ...p, password: e.target.value }))} placeholder="Оставьте пустым, чтобы не менять" /></div>
+                                    </div>
+                                    <div className="btn-group"><button className="btn btn-primary btn-sm" onClick={() => handleUpdateEmployee(emp.id)}>Сохранить</button><button className="btn btn-secondary btn-sm" onClick={() => setEditingEmpId(null)}>Отмена</button></div>
                                 </div>
-                                {rd.description && <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>{rd.description}</p>}
+                            ) : (
+                                <>
+                                    <div>
+                                        <div className="emp-name">{emp.full_name}</div>
+                                        <div className="emp-detail">{[emp.position, emp.phone, emp.email].filter(Boolean).join(' · ') || 'Нет подробностей'}</div>
+                                    </div>
+                                    <div className="btn-group" style={{ marginTop: 0 }}>
+                                        <button className="btn btn-ghost btn-xs" onClick={() => { setEditingEmpId(emp.id); setEditEmp(emp); }}>Изменить</button>
+                                        <button className="btn btn-danger btn-xs" onClick={() => handleDeleteEmployee(emp.id)}>Удалить</button>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    ))}
 
-                                {catDocs.map(doc => {
-                                    const fi = getFileIcon(doc.file_type);
+                    <div style={{ borderTop: '1px solid var(--border-light)', paddingTop: 16, marginTop: 16 }}>
+                        <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.4px' }}>Добавить сотрудника</p>
+                        <div className="form-grid">
+                            <div className="form-group"><label>ФИО</label><input value={newEmpName} onChange={e => setNewEmpName(e.target.value)} placeholder="Фамилия Имя Отчество" /></div>
+                            <div className="form-group"><label>Должность</label><input value={newEmpPosition} onChange={e => setNewEmpPosition(e.target.value)} placeholder="Инженер, Прораб..." /></div>
+                            <div className="form-group"><label>Телефон</label><input value={newEmpPhone} onChange={e => setNewEmpPhone(e.target.value)} placeholder="+7 (___) ___-__-__" /></div>
+                            <div className="form-group"><label>Email</label><input value={newEmpEmail} onChange={e => setNewEmpEmail(e.target.value)} placeholder="email@example.ru" /></div>
+                            <div className="form-group"><label>Пароль</label><input type="password" value={newEmpPassword} onChange={e => setNewEmpPassword(e.target.value)} placeholder="Необязательно" /><span className="hint">Если не задан, вход будет без пароля</span></div>
+                        </div>
+                        <button className="btn btn-primary btn-sm" style={{ marginTop: 10 }} onClick={handleAddEmployee}>Добавить</button>
+                    </div>
+                </div>
+            )}
+
+            {/* ===== OBJECT TAB ===== */}
+            {activeTab === 'object' && selectedObject && (
+                <div className="card">
+                    <div className="card-title">Сведения об объекте</div>
+                    <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16, lineHeight: 1.5 }}>
+                        Заполните информацию о строительном объекте. Эти данные используются при формировании документации.
+                    </p>
+                    <div className="form-grid">
+                        <div className="form-group full-width"><label>Наименование объекта</label><input value={selectedObject.object_name} onChange={e => updateObject('object_name', e.target.value)} placeholder='Например: Жилой дом «Солнечный», корпуc 3' /><span className="hint">Укажите краткое, понятное название для идентификации объекта</span></div>
+                        <div className="form-group full-width"><label>Адрес объекта</label><input value={selectedObject.object_address} onChange={e => updateObject('object_address', e.target.value)} placeholder="Город, район, улица, номер участка" /></div>
+                        <div className="form-group full-width"><label>Назначение объекта</label><input value={selectedObject.object_purpose} onChange={e => updateObject('object_purpose', e.target.value)} placeholder="Жилое, промышленное, коммерческое..." /></div>
+                        <div className="form-group full-width"><label>Технико-экономические показатели</label><textarea value={selectedObject.tech_economic_indicators} onChange={e => updateObject('tech_economic_indicators', e.target.value)} placeholder="Общая площадь, этажность, количество квартир/помещений, год постройки" /><span className="hint">Основные параметры объекта, которые могут потребоваться для документации</span></div>
+                        <div className="form-group full-width"><label>Тип строительства</label><input value={selectedObject.construction_type} onChange={e => updateObject('construction_type', e.target.value)} placeholder="Новое строительство, реконструкция, капитальный ремонт" /></div>
+                        <div className="form-group full-width"><label>Финансирование</label><textarea value={selectedObject.financing_info} onChange={e => updateObject('financing_info', e.target.value)} placeholder="Источники финансирования, бюджет, контрактная стоимость" /></div>
+                        <div className="form-group full-width"><label>Здания и сооружения</label><textarea value={selectedObject.buildings_info} onChange={e => updateObject('buildings_info', e.target.value)} placeholder="Перечень зданий и сооружений, входящих в состав объекта" /></div>
+                        <div className="form-group full-width"><label>Обоснование стоимости</label><textarea value={selectedObject.cost_justification} onChange={e => updateObject('cost_justification', e.target.value)} placeholder="Обоснование сметной стоимости строительства" /></div>
+                    </div>
+                    <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={handleSaveObject} disabled={savingObj}>
+                        {savingObj ? 'Сохранение...' : 'Сохранить данные объекта'}
+                    </button>
+                </div>
+            )}
+
+            {/* ===== DOCUMENTS TAB ===== */}
+            {activeTab === 'docs' && (
+                <>
+                    {selectedObjectId ? (
+                        <>
+                            {requiredDocs.map(req => {
+                                const docs = getDocsForCategory(req.doc_name);
+                                return (
+                                    <div key={req.id} className="req-category">
+                                        <div className="req-category-head">
+                                            <div className="req-category-name">{req.doc_name}</div>
+                                            {docs.length > 0 && <span className={`badge badge-${docs.some(d => d.status === 'accepted') ? 'accepted' : docs.some(d => d.status === 'rejected') ? 'rejected' : 'pending'}`}>{docs.some(d => d.status === 'accepted') ? 'Принят' : docs.some(d => d.status === 'rejected') ? 'Отклонён' : 'На проверке'}</span>}
+                                        </div>
+                                        {req.description && <div className="req-category-desc">{req.description}</div>}
+
+                                        {docs.map(doc => {
+                                            const fIcon = getFileIcon(doc.file_type);
+                                            return (
+                                                <div key={doc.id} className="doc-item">
+                                                    <div className={`doc-icon ${fIcon.cls}`}>{fIcon.label}</div>
+                                                    <div className="doc-info">
+                                                        <a href={`/api/clients/${token}/documents/${doc.id}`} className="doc-name" style={{ textDecoration: 'none', color: 'inherit' }} download>{doc.original_name}</a>
+                                                        <div className="doc-meta">
+                                                            {formatSize(doc.file_size)} · <span className="status-dot" style={{ display: 'inline-block' }}><span className={`status-dot ${doc.status}`} /></span> {statusLabel(doc.status)}
+                                                            {doc.uploaded_by_name && ` · ${doc.uploaded_by_name}`}
+                                                            {doc.status_comment && <span style={{ color: 'var(--red)' }}> — {doc.status_comment}</span>}
+                                                        </div>
+                                                    </div>
+                                                    {doc.status === 'pending' && <button className="btn btn-danger btn-xs" onClick={() => handleDeleteDoc(doc.id)}>Удалить</button>}
+                                                </div>
+                                            );
+                                        })}
+
+                                        <div className="dropzone" style={{ marginTop: 6 }}
+                                            onClick={() => fileInputRefs.current[req.doc_name]?.click()}
+                                            onDragOver={e => e.preventDefault()} onDrop={e => handleDropUpload(e, req.doc_name)}>
+                                            <input type="file" ref={el => { fileInputRefs.current[req.doc_name] = el; }} hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
+                                                onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f, req.doc_name); e.target.value = ''; }} />
+                                            {uploading === req.doc_name ? (
+                                                <div className="spinner" style={{ margin: '4px auto' }} />
+                                            ) : (
+                                                <>
+                                                    <div className="dropzone-label">{docs.length > 0 ? 'Загрузить новую версию' : 'Нажмите или перетащите файл'}</div>
+                                                    <div className="dropzone-hint">PDF, DOC, DOCX, XLS, XLSX, JPG, PNG — до 50 МБ</div>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+
+                            <div className="req-category" style={{ borderStyle: 'dashed' }}>
+                                <div className="req-category-name">Прочие документы</div>
+                                <div className="req-category-desc" style={{ marginBottom: 8 }}>Загрузите документы, не входящие в обязательный перечень</div>
+                                {getDocsForCategory('Прочее').map(doc => {
+                                    const fIcon = getFileIcon(doc.file_type);
                                     return (
-                                        <div key={doc.id} className="doc-row">
-                                            <div className={`file-icon ${fi.cls}`}>{fi.label}</div>
+                                        <div key={doc.id} className="doc-item">
+                                            <div className={`doc-icon ${fIcon.cls}`}>{fIcon.label}</div>
                                             <div className="doc-info">
-                                                <div className="doc-name">{doc.original_name}</div>
-                                                <div className="doc-meta">{formatSize(doc.file_size)} &middot; {formatDate(doc.uploaded_at)}</div>
-                                                {doc.status === 'rejected' && doc.status_comment && (
-                                                    <div className="doc-comment">Причина отклонения: {doc.status_comment}</div>
-                                                )}
+                                                <a href={`/api/clients/${token}/documents/${doc.id}`} className="doc-name" style={{ textDecoration: 'none', color: 'inherit' }} download>{doc.original_name}</a>
+                                                <div className="doc-meta">{formatSize(doc.file_size)} · {statusLabel(doc.status)}{doc.uploaded_by_name && ` · ${doc.uploaded_by_name}`}</div>
                                             </div>
-                                            <div className="doc-actions">
-                                                <span className={`badge badge-${doc.status}`}>{statusLabel(doc.status)}</span>
-                                                <a href={`/api/clients/${token}/documents/${doc.id}`} className="btn btn-secondary btn-sm" download>Скачать</a>
-                                                <button className="btn btn-danger btn-sm" onClick={() => handleDeleteDoc(doc.id)}>Удалить</button>
-                                            </div>
+                                            {doc.status === 'pending' && <button className="btn btn-danger btn-xs" onClick={() => handleDeleteDoc(doc.id)}>Удалить</button>}
                                         </div>
                                     );
                                 })}
-
-                                <div
-                                    className={`dropzone dropzone-sm ${uploading === rd.doc_name ? 'drag-over' : ''}`}
-                                    style={{ marginTop: catDocs.length > 0 ? 12 : 0 }}
-                                    onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
-                                    onDrop={e => handleDropUpload(e, rd.doc_name)}
-                                    onClick={() => fileInputRefs.current[rd.doc_name]?.click()}
-                                >
-                                    <input type="file" ref={el => { fileInputRefs.current[rd.doc_name] = el; }} hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
-                                        onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f, rd.doc_name); e.target.value = ''; }} />
-                                    {uploading === rd.doc_name ? <span className="loader"></span> : <span className="dropzone-icon">&uarr;</span>}
-                                    <div>
-                                        <div className="dropzone-text">{hasDoc ? 'Загрузить другой файл' : 'Нажмите или перетащите файл'}</div>
-                                        <div className="dropzone-hint">PDF, DOC, DOCX, XLS, XLSX, JPG, PNG — до 50 МБ</div>
-                                    </div>
+                                <div className="dropzone" style={{ marginTop: 6 }} onClick={() => fileInputRefs.current['_other']?.click()}
+                                    onDragOver={e => e.preventDefault()} onDrop={e => handleDropUpload(e, 'Прочее')}>
+                                    <input type="file" ref={el => { fileInputRefs.current['_other'] = el; }} hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
+                                        onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f, 'Прочее'); e.target.value = ''; }} />
+                                    <div className="dropzone-label">Загрузить дополнительный документ</div>
+                                    <div className="dropzone-hint">PDF, DOC, DOCX, XLS, XLSX, JPG, PNG — до 50 МБ</div>
                                 </div>
                             </div>
-                        );
-                    })}
-
-                    <div className="card section-gap">
-                        <div className="card-header"><h2><span className="icon">|</span> Прочие документы</h2></div>
-                        <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12 }}>Дополнительные документы, которых нет в списке выше.</p>
-                        {documents.filter(d => !requiredDocs.some(rd => rd.doc_name === d.category)).map(doc => {
-                            const fi = getFileIcon(doc.file_type);
-                            return (
-                                <div key={doc.id} className="doc-row">
-                                    <div className={`file-icon ${fi.cls}`}>{fi.label}</div>
-                                    <div className="doc-info">
-                                        <div className="doc-name">{doc.original_name}</div>
-                                        <div className="doc-meta">{formatSize(doc.file_size)} &middot; {formatDate(doc.uploaded_at)}</div>
-                                    </div>
-                                    <div className="doc-actions">
-                                        <span className={`badge badge-${doc.status}`}>{statusLabel(doc.status)}</span>
-                                        <a href={`/api/clients/${token}/documents/${doc.id}`} className="btn btn-secondary btn-sm" download>Скачать</a>
-                                        <button className="btn btn-danger btn-sm" onClick={() => handleDeleteDoc(doc.id)}>Удалить</button>
-                                    </div>
-                                </div>
-                            );
-                        })}
-                        <div className="dropzone dropzone-sm" style={{ marginTop: 12 }}
-                            onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
-                            onDrop={e => handleDropUpload(e, 'Прочее')}
-                            onClick={() => fileInputRefs.current['_other']?.click()}>
-                            <input type="file" ref={el => { fileInputRefs.current['_other'] = el; }} hidden accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
-                                onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f, 'Прочее'); e.target.value = ''; }} />
-                            <span className="dropzone-icon">&uarr;</span>
-                            <div>
-                                <div className="dropzone-text">Загрузить дополнительный документ</div>
-                                <div className="dropzone-hint">PDF, DOC, DOCX, XLS, XLSX, JPG, PNG — до 50 МБ</div>
-                            </div>
-                        </div>
-                    </div>
+                        </>
+                    ) : (
+                        <div className="card"><div className="loading-center"><span>Нет объектов. Сначала создайте объект на вкладке «Объекты».</span></div></div>
+                    )}
                 </>
             )}
 
+            {/* ===== CHAT TAB ===== */}
             {activeTab === 'chat' && (
-                <div className="card">
-                    <div className="card-header"><h2><span className="icon">|</span> Переписка с менеджером</h2></div>
-                    <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 12 }}>Задайте вопрос менеджеру, если что-то непонятно.</p>
-                    <div className="chat-container">
+                <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                    <div style={{ padding: '16px 20px 0' }}>
+                        <div className="card-title" style={{ marginBottom: 12 }}>Переписка с менеджером</div>
+                    </div>
+                    <div className={`chat-wrap ${chatDragOver ? 'drag-over' : ''}`}
+                        onDragOver={e => { e.preventDefault(); setChatDragOver(true); }}
+                        onDragLeave={() => setChatDragOver(false)}
+                        onDrop={e => { e.preventDefault(); setChatDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) handleSendMessage(f); }}
+                    >
                         <div className="chat-messages">
-                            {messages.length === 0 && <div className="empty-state"><p>Нет сообщений. Напишите менеджеру!</p></div>}
+                            {messages.length === 0 && <div className="loading-center" style={{ padding: 40 }}><span>Нет сообщений. Напишите менеджеру — он ответит в ближайшее время.</span></div>}
                             {messages.map(msg => (
                                 <div key={msg.id} className={`chat-bubble ${msg.sender}`}>
-                                    <div>{msg.text}</div>
+                                    {msg.sender_name && <div className="chat-sender">{msg.sender_name}</div>}
+                                    {msg.text && <div>{msg.text}</div>}
+                                    {msg.attachment_filename && isImageType(msg.attachment_type) && (
+                                        <img src={`/api/clients/${token}/messages/${msg.id}`} alt={msg.attachment_original_name} className="chat-img-thumb"
+                                            onClick={() => setPreviewImage(`/api/clients/${token}/messages/${msg.id}`)} />
+                                    )}
+                                    {msg.attachment_filename && !isImageType(msg.attachment_type) && (
+                                        <a href={`/api/clients/${token}/messages/${msg.id}`} className="chat-attachment" download>
+                                            <span className="att-label">FILE</span>
+                                            <span className="att-name">{msg.attachment_original_name}</span>
+                                            <span className="att-size">{formatSize(msg.attachment_size)}</span>
+                                        </a>
+                                    )}
                                     <div className="chat-time">{formatDate(msg.created_at)}</div>
                                 </div>
                             ))}
                             <div ref={chatEndRef} />
                         </div>
-                        <div className="chat-input-row">
+                        <div className="chat-input-bar">
                             <input value={msgText} onChange={e => setMsgText(e.target.value)} placeholder="Введите сообщение..." onKeyDown={e => e.key === 'Enter' && handleSendMessage()} />
-                            <button className="btn btn-primary" onClick={handleSendMessage}>Отправить</button>
+                            <input type="file" id="chatFileInput" hidden onChange={e => { const f = e.target.files?.[0]; if (f) handleSendMessage(f); e.target.value = ''; }} />
+                            <label htmlFor="chatFileInput" className="attach-btn" title="Прикрепить файл" />
+                            <button className="btn btn-primary" onClick={() => handleSendMessage()}>Отправить</button>
                         </div>
                     </div>
+                </div>
+            )}
+
+            {/* ===== NEW OBJECT MODAL ===== */}
+            {showNewObjModal && (
+                <div className="overlay" onClick={() => setShowNewObjModal(false)}>
+                    <div className="modal" onClick={e => e.stopPropagation()}>
+                        <h3>Новый объект</h3>
+                        <div className="form-group" style={{ marginBottom: 16 }}>
+                            <label>Название объекта</label>
+                            <input value={newObjName} onChange={e => setNewObjName(e.target.value)} placeholder='Жилой комплекс «Солнечный», корпус 2' autoFocus onKeyDown={e => e.key === 'Enter' && handleCreateObject()} />
+                            <span className="hint">Укажите понятное название, чтобы вы и ваш менеджер могли легко его найти</span>
+                        </div>
+                        <div className="btn-group">
+                            <button className="btn btn-primary" onClick={handleCreateObject}>Создать</button>
+                            <button className="btn btn-secondary" onClick={() => setShowNewObjModal(false)}>Отмена</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {previewImage && (
+                <div className="img-preview-overlay" onClick={() => setPreviewImage(null)}>
+                    <img src={previewImage} alt="Просмотр" />
                 </div>
             )}
 

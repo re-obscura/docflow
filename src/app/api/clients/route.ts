@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { v4 as uuidv4 } from 'uuid';
 import { NextRequest, NextResponse } from 'next/server';
 import { sanitizeString, checkRateLimit, requireAdmin } from '@/lib/security';
+import { logAudit } from '@/lib/audit';
 
 const DEFAULT_REQUIRED_DOCS = [
     { doc_name: 'Техническое задание', description: 'Техническое задание на выполнение работ' },
@@ -15,16 +16,31 @@ export async function GET(request: NextRequest) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
+        const { searchParams } = new URL(request.url);
+        const search = searchParams.get('q')?.trim() || '';
+
         const db = getDb();
-        const clients = db.prepare(`
+        let query = `
       SELECT c.*, 
         (SELECT COUNT(*) FROM documents WHERE client_id = c.id) as doc_count,
         (SELECT COUNT(*) FROM documents WHERE client_id = c.id AND status = 'pending') as pending_count,
         (SELECT COUNT(*) FROM documents WHERE client_id = c.id AND status = 'accepted') as accepted_count,
         (SELECT COUNT(*) FROM documents WHERE client_id = c.id AND status = 'rejected') as rejected_count,
-        (SELECT COUNT(*) FROM messages WHERE client_id = c.id AND sender = 'client' AND id > COALESCE((SELECT MAX(id) FROM messages WHERE client_id = c.id AND sender = 'admin'), 0)) as unread_count
-      FROM clients c ORDER BY c.created_at DESC
-    `).all();
+        (SELECT COUNT(*) FROM messages WHERE client_id = c.id AND sender = 'client' AND id > COALESCE((SELECT MAX(id) FROM messages WHERE client_id = c.id AND sender = 'admin'), 0)) as unread_count,
+        (SELECT COUNT(*) FROM employees WHERE client_id = c.id) as employee_count,
+        (SELECT COUNT(*) FROM objects WHERE client_id = c.id) as object_count
+      FROM clients c
+    `;
+        const params: unknown[] = [];
+
+        if (search) {
+            query += ` WHERE c.company_name LIKE ? OR c.inn LIKE ? OR c.contact_person LIKE ?`;
+            const term = `%${search}%`;
+            params.push(term, term, term);
+        }
+
+        query += ' ORDER BY c.created_at DESC';
+        const clients = db.prepare(query).all(...params);
         return NextResponse.json(clients);
     } catch {
         return NextResponse.json({ error: 'Failed to fetch clients' }, { status: 500 });
@@ -54,12 +70,22 @@ export async function POST(request: NextRequest) {
 
         const clientId = result.lastInsertRowid;
 
+        // Create a default first object
+        const objResult = db.prepare(
+            `INSERT INTO objects (client_id, object_name) VALUES (?, ?)`
+        ).run(clientId, 'Объект 1');
+
+        const objectId = objResult.lastInsertRowid;
+
+        // Bind default required docs to the first object
         const insertReqDoc = db.prepare(
-            `INSERT INTO required_docs (client_id, doc_name, description) VALUES (?, ?, ?)`
+            `INSERT INTO required_docs (client_id, object_id, doc_name, description) VALUES (?, ?, ?, ?)`
         );
         for (const doc of DEFAULT_REQUIRED_DOCS) {
-            insertReqDoc.run(clientId, doc.doc_name, doc.description);
+            insertReqDoc.run(clientId, objectId, doc.doc_name, doc.description);
         }
+
+        logAudit(Number(clientId), 'Администратор', 'admin', 'Создан клиент', 'client', Number(clientId), company_name);
 
         return NextResponse.json({ token, id: clientId }, { status: 201 });
     } catch {

@@ -23,7 +23,13 @@ export async function GET(
         if (!client) {
             return NextResponse.json({ error: 'Client not found' }, { status: 404 });
         }
-        const documents = db.prepare('SELECT * FROM documents WHERE client_id = ? ORDER BY uploaded_at DESC').all(client.id);
+        const objectId = request.nextUrl.searchParams.get('object_id');
+        let documents;
+        if (objectId) {
+            documents = db.prepare('SELECT * FROM documents WHERE client_id = ? AND object_id = ? ORDER BY uploaded_at DESC').all(client.id, objectId);
+        } else {
+            documents = db.prepare('SELECT * FROM documents WHERE client_id = ? ORDER BY uploaded_at DESC').all(client.id);
+        }
         return NextResponse.json(documents);
     } catch {
         return NextResponse.json({ error: 'Failed to fetch documents' }, { status: 500 });
@@ -54,6 +60,9 @@ export async function POST(
         const formData = await request.formData();
         const file = formData.get('file') as File | null;
         const category = sanitizeString((formData.get('category') as string) || '', 300);
+        const objectId = formData.get('object_id') ? Number(formData.get('object_id')) : null;
+        const uploadedByEmployeeId = formData.get('uploaded_by_employee_id') ? Number(formData.get('uploaded_by_employee_id')) : null;
+        const uploadedByName = sanitizeString((formData.get('uploaded_by_name') as string) || '', 200);
 
         if (!file) {
             return NextResponse.json({ error: 'Файл не выбран' }, { status: 400 });
@@ -91,9 +100,9 @@ export async function POST(
         const safeName = file.name.replace(/[<>"]/g, '').slice(0, 255);
 
         const result = db.prepare(`
-      INSERT INTO documents (client_id, filename, original_name, file_type, file_size, category)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(client.id, filename, safeName, file.type, file.size, category);
+      INSERT INTO documents (client_id, object_id, filename, original_name, file_type, file_size, category, uploaded_by_employee_id, uploaded_by_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(client.id, objectId, filename, safeName, file.type, file.size, category, uploadedByEmployeeId, uploadedByName);
 
         const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
         return NextResponse.json(doc, { status: 201 });
