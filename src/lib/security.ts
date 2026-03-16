@@ -1,46 +1,43 @@
 import { randomBytes, createHash, timingSafeEqual } from 'crypto';
+import { getDb } from '@/lib/db';
 
-// In-memory store for admin sessions (survives hot reloads via global)
-const globalSessions = (globalThis as Record<string, unknown>);
-if (!globalSessions.__adminSessions) {
-    globalSessions.__adminSessions = new Map<string, { createdAt: number }>();
-}
-const sessions = globalSessions.__adminSessions as Map<string, { createdAt: number }>;
+// ─── SQLite-backed admin sessions ───
 
 const SESSION_TTL = 8 * 60 * 60 * 1000; // 8 hours
 
 export function createSession(): string {
     const token = randomBytes(32).toString('hex');
-    sessions.set(token, { createdAt: Date.now() });
+    const db = getDb();
+    db.prepare('INSERT OR REPLACE INTO admin_sessions (token, created_at) VALUES (?, ?)').run(token, Date.now());
     cleanExpiredSessions();
     return token;
 }
 
 export function validateSession(token: string | null): boolean {
     if (!token) return false;
-    const session = sessions.get(token);
+    const db = getDb();
+    const session = db.prepare('SELECT created_at FROM admin_sessions WHERE token = ?').get(token) as { created_at: number } | undefined;
     if (!session) return false;
-    if (Date.now() - session.createdAt > SESSION_TTL) {
-        sessions.delete(token);
+    if (Date.now() - session.created_at > SESSION_TTL) {
+        db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
         return false;
     }
     return true;
 }
 
 export function destroySession(token: string): void {
-    sessions.delete(token);
+    const db = getDb();
+    db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
 }
 
 function cleanExpiredSessions(): void {
-    const now = Date.now();
-    for (const [key, val] of sessions.entries()) {
-        if (now - val.createdAt > SESSION_TTL) {
-            sessions.delete(key);
-        }
-    }
+    const db = getDb();
+    const cutoff = Date.now() - SESSION_TTL;
+    db.prepare('DELETE FROM admin_sessions WHERE created_at < ?').run(cutoff);
 }
 
-// Rate limiting
+// ─── Rate limiting (in-memory, acceptable for single-instance) ───
+
 interface RateEntry {
     count: number;
     resetAt: number;
@@ -76,7 +73,8 @@ export function checkRateLimit(key: string, maxRequests: number, windowMs: numbe
     return true;
 }
 
-// Input sanitization
+// ─── Input sanitization ───
+
 export function sanitizeString(input: string, maxLength: number = 500): string {
     if (typeof input !== 'string') return '';
     return input
@@ -94,12 +92,14 @@ export function sanitizeText(input: string, maxLength: number = 5000): string {
         .replace(/<[^>]+>/g, '');
 }
 
-// Token validation (UUID v4 format)
+// ─── Token validation (UUID v4 format) ───
+
 export function isValidToken(token: string): boolean {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token);
 }
 
-// File validation
+// ─── File validation ───
+
 const ALLOWED_MIME_TYPES = new Set([
     'application/pdf',
     'application/msword',
@@ -120,22 +120,24 @@ export function isAllowedFile(filename: string, mimeType: string): boolean {
     return ALLOWED_EXTENSIONS.has(ext) && (ALLOWED_MIME_TYPES.has(mimeType) || mimeType === 'application/octet-stream');
 }
 
-// Password comparison (constant-time via timingSafeEqual)
+// ─── Password comparison (constant-time via timingSafeEqual) ───
+
 export function secureCompare(a: string, b: string): boolean {
-    // Hash both to fixed length to prevent timing attack on length difference
     const ha = createHash('sha256').update(a).digest();
     const hb = createHash('sha256').update(b).digest();
     return timingSafeEqual(ha, hb);
 }
 
-// Extract and validate admin session from Authorization header
+// ─── Extract and validate admin session from Authorization header ───
+
 export function requireAdmin(authHeader: string | null): boolean {
     if (!authHeader) return false;
     const token = authHeader.replace(/^Bearer\s+/i, '');
     return validateSession(token);
 }
 
-// Password hashing with bcrypt
+// ─── Password hashing with bcrypt ───
+
 import { hashSync, compareSync } from 'bcryptjs';
 
 export function hashPassword(password: string): string {
@@ -145,7 +147,12 @@ export function hashPassword(password: string): string {
 export function verifyPassword(password: string, hash: string): boolean {
     // Handle legacy plain-text passwords: if hash doesn't start with $2, it's plain text
     if (!hash.startsWith('$2')) {
-        return password === hash;
+        return secureCompare(password, hash);
     }
     return compareSync(password, hash);
+}
+
+/** Returns true if the hash is legacy plain-text and should be migrated to bcrypt */
+export function needsPasswordMigration(hash: string): boolean {
+    return hash !== '' && !hash.startsWith('$2');
 }

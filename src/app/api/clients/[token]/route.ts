@@ -3,6 +3,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { sanitizeString, sanitizeText, isValidToken, requireAdmin, checkRateLimit } from '@/lib/security';
 import { rmSync } from 'fs';
 import path from 'path';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
 
@@ -13,17 +15,18 @@ export async function GET(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
         const client = db.prepare('SELECT * FROM clients WHERE token = ?').get(token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
         return NextResponse.json(client);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch client' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch client', { error: String(err) });
+        return apiError('Failed to fetch client', 500);
     }
 }
 
@@ -34,22 +37,24 @@ export async function PUT(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
+        // Rate limit
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`put:${token}:${ip}`, 20, 60000)) {
-            return NextResponse.json({ error: 'Слишком много запросов. Попробуйте позже.' }, { status: 429 });
+            return apiError('Слишком много запросов. Попробуйте позже.', 429);
         }
 
         const body = await request.json();
         const db = getDb();
 
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
+        // Note: legacy object_* fields removed — object data is managed via /objects endpoint
         db.prepare(`
       UPDATE clients SET 
         company_name = ?, short_name = ?, legal_form = ?,
@@ -58,11 +63,7 @@ export async function PUT(
         bank_name = ?, bank_account = ?, corr_account = ?, bik = ?,
         director_name = ?, director_title = ?, acts_on_basis = ?,
         contact_person = ?, phone = ?, email = ?, fax = ?, website = ?,
-        tax_system = ?, sro_name = ?, sro_number = ?,
-        object_name = ?, object_address = ?, object_purpose = ?,
-        tech_economic_indicators = ?,
-        construction_type = ?, financing_info = ?,
-        buildings_info = ?, cost_justification = ?
+        tax_system = ?, sro_name = ?, sro_number = ?
       WHERE token = ?
     `).run(
             sanitizeString(body.company_name, 500),
@@ -92,21 +93,14 @@ export async function PUT(
             sanitizeString(body.tax_system, 100),
             sanitizeString(body.sro_name, 500),
             sanitizeString(body.sro_number, 100),
-            sanitizeString(body.object_name, 500),
-            sanitizeString(body.object_address, 500),
-            sanitizeText(body.object_purpose, 2000),
-            sanitizeText(body.tech_economic_indicators, 5000),
-            sanitizeString(body.construction_type, 300),
-            sanitizeText(body.financing_info, 2000),
-            sanitizeText(body.buildings_info, 5000),
-            sanitizeText(body.cost_justification, 5000),
             token
         );
 
         const updated = db.prepare('SELECT * FROM clients WHERE token = ?').get(token);
         return NextResponse.json(updated);
-    } catch {
-        return NextResponse.json({ error: 'Failed to update client' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to update client', { error: String(err) });
+        return apiError('Failed to update client', 500);
     }
 }
 
@@ -116,18 +110,18 @@ export async function DELETE(
 ) {
     try {
         if (!requireAdmin(request.headers.get('authorization'))) {
-            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            return apiError('Unauthorized', 401);
         }
 
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         try {
@@ -137,7 +131,8 @@ export async function DELETE(
 
         db.prepare('DELETE FROM clients WHERE token = ?').run(token);
         return NextResponse.json({ success: true });
-    } catch {
-        return NextResponse.json({ error: 'Failed to delete client' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to delete client', { error: String(err) });
+        return apiError('Failed to delete client', 500);
     }
 }

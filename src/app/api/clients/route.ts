@@ -3,23 +3,23 @@ import { v4 as uuidv4 } from 'uuid';
 import { NextRequest, NextResponse } from 'next/server';
 import { sanitizeString, checkRateLimit, requireAdmin } from '@/lib/security';
 import { logAudit } from '@/lib/audit';
-
-const DEFAULT_REQUIRED_DOCS = [
-    { doc_name: 'Техническое задание', description: 'Техническое задание на выполнение работ' },
-    { doc_name: 'Транспортная схема вывоза мусора', description: 'Схема транспортировки и вывоза строительного мусора' },
-    { doc_name: 'Письмо о включении затрат в сводный сметный расчёт', description: 'Письмо о включении затрат в сводный сметный расчёт стоимости строительства (лимитированные затраты)' },
-];
+import { logger } from '@/lib/logger';
+import { DEFAULT_REQUIRED_DOCS } from '@/lib/constants';
+import { apiError } from '@/lib/helpers';
 
 export async function GET(request: NextRequest) {
     try {
         if (!requireAdmin(request.headers.get('authorization'))) {
-            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            return apiError('Unauthorized', 401);
         }
 
         const { searchParams } = new URL(request.url);
         const search = searchParams.get('q')?.trim() || '';
+        const limit = Math.min(Number(searchParams.get('limit') || 50), 200);
+        const offset = Math.max(Number(searchParams.get('offset') || 0), 0);
 
         const db = getDb();
+        let countQuery = 'SELECT COUNT(*) as total FROM clients c';
         let query = `
       SELECT c.*, 
         (SELECT COUNT(*) FROM documents WHERE client_id = c.id) as doc_count,
@@ -32,30 +32,38 @@ export async function GET(request: NextRequest) {
       FROM clients c
     `;
         const params: unknown[] = [];
+        const countParams: unknown[] = [];
 
         if (search) {
-            query += ` WHERE c.company_name LIKE ? OR c.inn LIKE ? OR c.contact_person LIKE ?`;
+            const whereClause = ` WHERE c.company_name LIKE ? OR c.inn LIKE ? OR c.contact_person LIKE ?`;
+            query += whereClause;
+            countQuery += whereClause;
             const term = `%${search}%`;
             params.push(term, term, term);
+            countParams.push(term, term, term);
         }
 
-        query += ' ORDER BY c.created_at DESC';
+        const { total } = db.prepare(countQuery).get(...countParams) as { total: number };
+
+        query += ' ORDER BY c.created_at DESC LIMIT ? OFFSET ?';
+        params.push(limit, offset);
         const clients = db.prepare(query).all(...params);
-        return NextResponse.json(clients);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch clients' }, { status: 500 });
+        return NextResponse.json({ clients, total });
+    } catch (err) {
+        logger.error('Failed to fetch clients', { error: String(err) });
+        return apiError('Failed to fetch clients', 500);
     }
 }
 
 export async function POST(request: NextRequest) {
     try {
         if (!requireAdmin(request.headers.get('authorization'))) {
-            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            return apiError('Unauthorized', 401);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`create:${ip}`, 20, 60000)) {
-            return NextResponse.json({ error: 'Слишком много запросов' }, { status: 429 });
+            return apiError('Слишком много запросов', 429);
         }
 
         const body = await request.json();
@@ -64,31 +72,38 @@ export async function POST(request: NextRequest) {
         const token = uuidv4();
         const db = getDb();
 
-        const result = db.prepare(
-            `INSERT INTO clients (token, company_name, contact_person) VALUES (?, ?, ?)`
-        ).run(token, company_name, contact_person);
+        const createClient = db.transaction(() => {
+            const result = db.prepare(
+                `INSERT INTO clients (token, company_name, contact_person) VALUES (?, ?, ?)`
+            ).run(token, company_name, contact_person);
 
-        const clientId = result.lastInsertRowid;
+            const clientId = result.lastInsertRowid;
 
-        // Create a default first object
-        const objResult = db.prepare(
-            `INSERT INTO objects (client_id, object_name) VALUES (?, ?)`
-        ).run(clientId, 'Объект 1');
+            // Create a default first object
+            const objResult = db.prepare(
+                `INSERT INTO objects (client_id, object_name) VALUES (?, ?)`
+            ).run(clientId, 'Объект 1');
 
-        const objectId = objResult.lastInsertRowid;
+            const objectId = objResult.lastInsertRowid;
 
-        // Bind default required docs to the first object
-        const insertReqDoc = db.prepare(
-            `INSERT INTO required_docs (client_id, object_id, doc_name, description) VALUES (?, ?, ?, ?)`
-        );
-        for (const doc of DEFAULT_REQUIRED_DOCS) {
-            insertReqDoc.run(clientId, objectId, doc.doc_name, doc.description);
-        }
+            // Bind default required docs to the first object
+            const insertReqDoc = db.prepare(
+                `INSERT INTO required_docs (client_id, object_id, doc_name, description) VALUES (?, ?, ?, ?)`
+            );
+            for (const doc of DEFAULT_REQUIRED_DOCS) {
+                insertReqDoc.run(clientId, objectId, doc.doc_name, doc.description);
+            }
+
+            return clientId;
+        });
+
+        const clientId = createClient();
 
         logAudit(Number(clientId), 'Администратор', 'admin', 'Создан клиент', 'client', Number(clientId), company_name);
 
         return NextResponse.json({ token, id: clientId }, { status: 201 });
-    } catch {
-        return NextResponse.json({ error: 'Failed to create client' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to create client', { error: String(err) });
+        return apiError('Failed to create client', 500);
     }
 }

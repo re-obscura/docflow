@@ -4,6 +4,8 @@ import { readFile, unlink } from 'fs/promises';
 import path from 'path';
 import { isValidToken, sanitizeString, requireAdmin } from '@/lib/security';
 import { logAudit } from '@/lib/audit';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
 
@@ -23,18 +25,18 @@ export async function GET(
     try {
         const { token, id } = await params;
         if (!isValidToken(token) || isNaN(Number(id))) {
-            return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+            return apiError('Invalid parameters', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const doc = db.prepare('SELECT * FROM documents WHERE id = ? AND client_id = ?').get(Number(id), client.id) as DocRow | undefined;
         if (!doc) {
-            return NextResponse.json({ error: 'Document not found' }, { status: 404 });
+            return apiError('Document not found', 404);
         }
 
         // Prevent path traversal in filename
@@ -42,7 +44,7 @@ export async function GET(
         const filePath = path.join(UPLOAD_DIR, String(client.id), safeFilename);
         const resolvedPath = path.resolve(filePath);
         if (!resolvedPath.startsWith(path.resolve(UPLOAD_DIR))) {
-            return NextResponse.json({ error: 'Invalid file path' }, { status: 400 });
+            return apiError('Invalid file path', 400);
         }
 
         const fileBuffer = await readFile(resolvedPath);
@@ -54,8 +56,9 @@ export async function GET(
                 'X-Content-Type-Options': 'nosniff',
             },
         });
-    } catch {
-        return NextResponse.json({ error: 'Failed to download document' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to download document', { error: String(err) });
+        return apiError('Failed to download document', 500);
     }
 }
 
@@ -66,24 +69,24 @@ export async function DELETE(
     try {
         const { token, id } = await params;
         if (!isValidToken(token) || isNaN(Number(id))) {
-            return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+            return apiError('Invalid parameters', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const doc = db.prepare('SELECT * FROM documents WHERE id = ? AND client_id = ?').get(Number(id), client.id) as DocRow | undefined;
         if (!doc) {
-            return NextResponse.json({ error: 'Document not found' }, { status: 404 });
+            return apiError('Document not found', 404);
         }
 
         // Clients can only delete pending documents; admins can delete any
         const isAdmin = requireAdmin(request.headers.get('authorization'));
         if (!isAdmin && doc.status !== 'pending') {
-            return NextResponse.json({ error: 'Можно удалить только документы со статусом «На проверке»' }, { status: 403 });
+            return apiError('Можно удалить только документы со статусом «На проверке»', 403);
         }
 
         try {
@@ -94,8 +97,9 @@ export async function DELETE(
         db.prepare('DELETE FROM documents WHERE id = ?').run(Number(id));
         logAudit(client.id, isAdmin ? 'Администратор' : 'Клиент', isAdmin ? 'admin' : 'employee', 'Удалён документ', 'document', Number(id), doc.original_name || '');
         return NextResponse.json({ success: true });
-    } catch {
-        return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to delete document', { error: String(err) });
+        return apiError('Failed to delete document', 500);
     }
 }
 
@@ -106,12 +110,12 @@ export async function PATCH(
     try {
         // Admin-only: change document status
         if (!requireAdmin(request.headers.get('authorization'))) {
-            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            return apiError('Unauthorized', 401);
         }
 
         const { token, id } = await params;
         if (!isValidToken(token) || isNaN(Number(id))) {
-            return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+            return apiError('Invalid parameters', 400);
         }
 
         const body = await request.json();
@@ -119,13 +123,13 @@ export async function PATCH(
         const status_comment = sanitizeString(body.status_comment || '', 1000);
 
         if (!['accepted', 'rejected', 'pending'].includes(status)) {
-            return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
+            return apiError('Invalid status', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         db.prepare(`
@@ -136,7 +140,8 @@ export async function PATCH(
         const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(Number(id));
         logAudit(client.id, 'Администратор', 'admin', `Документ ${status === 'accepted' ? 'принят' : status === 'rejected' ? 'отклонён' : 'возвращён на проверку'}`, 'document', Number(id), status_comment);
         return NextResponse.json(doc);
-    } catch {
-        return NextResponse.json({ error: 'Failed to update document status' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to update document status', { error: String(err) });
+        return apiError('Failed to update document status', 500);
     }
 }

@@ -1,11 +1,13 @@
 import { getDb } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '@/lib/security';
+import { logger } from '@/lib/logger';
+import { apiError } from '@/lib/helpers';
 
 export async function GET(request: NextRequest) {
     try {
         if (!requireAdmin(request.headers.get('authorization'))) {
-            return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+            return apiError('Unauthorized', 401);
         }
 
         const { searchParams } = new URL(request.url);
@@ -37,7 +39,8 @@ export async function GET(request: NextRequest) {
         const { total } = db.prepare(countQuery).get(...countParams) as { total: number };
 
         return NextResponse.json({ entries, total });
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch audit log' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch audit log', { error: String(err) });
+        return apiError('Failed to fetch audit log', 500);
     }
 }

@@ -163,8 +163,8 @@ export function formatDate(dateStr: string): string {
 
 export function getFileIcon(type: string): { label: string; cls: string } {
     if (type.includes('pdf')) return { label: 'PDF', cls: 'pdf' };
-    if (type.includes('word') || type.includes('doc')) return { label: 'DOC', cls: 'doc' };
     if (type.includes('sheet') || type.includes('xls')) return { label: 'XLS', cls: 'xls' };
+    if (type.includes('word') || type.includes('doc')) return { label: 'DOC', cls: 'doc' };
     if (type.includes('image')) return { label: 'IMG', cls: 'img' };
     return { label: 'FILE', cls: 'other' };
 }

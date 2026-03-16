@@ -2,6 +2,8 @@ import { getDb } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { isValidToken, sanitizeString, checkRateLimit, hashPassword } from '@/lib/security';
 import { logAudit } from '@/lib/audit';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
 
 export async function GET(
     request: NextRequest,
@@ -10,19 +12,20 @@ export async function GET(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const employees = db.prepare('SELECT id, client_id, full_name, position, phone, email, created_at FROM employees WHERE client_id = ? ORDER BY created_at ASC').all(client.id);
         return NextResponse.json(employees);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch employees' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch employees', { error: String(err) });
+        return apiError('Failed to fetch employees', 500);
     }
 }
 
@@ -33,18 +36,18 @@ export async function POST(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`emp:${token}:${ip}`, 20, 60000)) {
-            return NextResponse.json({ error: 'Слишком много запросов' }, { status: 429 });
+            return apiError('Слишком много запросов', 429);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const body = await request.json();
@@ -67,7 +70,8 @@ export async function POST(
 
         const employee = db.prepare('SELECT id, client_id, full_name, position, phone, email, created_at FROM employees WHERE id = ?').get(result.lastInsertRowid);
         return NextResponse.json(employee, { status: 201 });
-    } catch {
-        return NextResponse.json({ error: 'Failed to create employee' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to create employee', { error: String(err) });
+        return apiError('Failed to create employee', 500);
     }
 }

@@ -1,6 +1,10 @@
 import { getDb } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { sanitizeString, sanitizeText, isValidToken, checkRateLimit } from '@/lib/security';
+import { rmSync } from 'fs';
+import path from 'path';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
 
 export async function GET(
     request: NextRequest,
@@ -9,22 +13,23 @@ export async function GET(
     try {
         const { token, id } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const obj = db.prepare('SELECT * FROM objects WHERE id = ? AND client_id = ?').get(id, client.id);
         if (!obj) {
-            return NextResponse.json({ error: 'Object not found' }, { status: 404 });
+            return apiError('Object not found', 404);
         }
         return NextResponse.json(obj);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch object' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch object', { error: String(err) });
+        return apiError('Failed to fetch object', 500);
     }
 }
 
@@ -35,18 +40,18 @@ export async function PUT(
     try {
         const { token, id } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`obj:${token}:${ip}`, 20, 60000)) {
-            return NextResponse.json({ error: 'Слишком много запросов' }, { status: 429 });
+            return apiError('Слишком много запросов', 429);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const body = await request.json();
@@ -71,11 +76,12 @@ export async function PUT(
 
         const updated = db.prepare('SELECT * FROM objects WHERE id = ? AND client_id = ?').get(id, client.id);
         if (!updated) {
-            return NextResponse.json({ error: 'Object not found' }, { status: 404 });
+            return apiError('Object not found', 404);
         }
         return NextResponse.json(updated);
-    } catch {
-        return NextResponse.json({ error: 'Failed to update object' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to update object', { error: String(err) });
+        return apiError('Failed to update object', 500);
     }
 }
 
@@ -86,21 +92,29 @@ export async function DELETE(
     try {
         const { token, id } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
+        }
+
+        // Clean up uploaded files for documents belonging to this object
+        const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
+        const docs = db.prepare('SELECT filename FROM documents WHERE client_id = ? AND object_id = ?').all(client.id, Number(id)) as { filename: string }[];
+        for (const doc of docs) {
+            try { const safeName = path.basename(doc.filename); rmSync(path.join(UPLOAD_DIR, String(client.id), safeName), { force: true }); } catch { /* ignore */ }
         }
 
         const result = db.prepare('DELETE FROM objects WHERE id = ? AND client_id = ?').run(id, client.id);
         if (result.changes === 0) {
-            return NextResponse.json({ error: 'Object not found' }, { status: 404 });
+            return apiError('Object not found', 404);
         }
         return NextResponse.json({ success: true });
-    } catch {
-        return NextResponse.json({ error: 'Failed to delete object' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to delete object', { error: String(err) });
+        return apiError('Failed to delete object', 500);
     }
 }

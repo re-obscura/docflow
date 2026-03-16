@@ -4,9 +4,11 @@ import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { isValidToken, isAllowedFile, sanitizeString, checkRateLimit } from '@/lib/security';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
+import { MAX_FILE_SIZE } from '@/lib/constants';
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
 export async function GET(
     request: NextRequest,
@@ -15,13 +17,13 @@ export async function GET(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
         const objectId = request.nextUrl.searchParams.get('object_id');
         let documents;
@@ -31,8 +33,9 @@ export async function GET(
             documents = db.prepare('SELECT * FROM documents WHERE client_id = ? ORDER BY uploaded_at DESC').all(client.id);
         }
         return NextResponse.json(documents);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch documents' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch documents', { error: String(err) });
+        return apiError('Failed to fetch documents', 500);
     }
 }
 
@@ -43,18 +46,18 @@ export async function POST(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`upload:${token}:${ip}`, 30, 60000)) {
-            return NextResponse.json({ error: 'Слишком много загрузок. Попробуйте позже.' }, { status: 429 });
+            return apiError('Слишком много загрузок. Попробуйте позже.', 429);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const formData = await request.formData();
@@ -65,19 +68,19 @@ export async function POST(
         const uploadedByName = sanitizeString((formData.get('uploaded_by_name') as string) || '', 200);
 
         if (!file) {
-            return NextResponse.json({ error: 'Файл не выбран' }, { status: 400 });
+            return apiError('Файл не выбран', 400);
         }
 
         if (file.size > MAX_FILE_SIZE) {
-            return NextResponse.json({ error: 'Файл слишком большой (максимум 50 МБ)' }, { status: 400 });
+            return apiError('Файл слишком большой (максимум 50 МБ)', 400);
         }
 
         if (file.size === 0) {
-            return NextResponse.json({ error: 'Файл пустой' }, { status: 400 });
+            return apiError('Файл пустой', 400);
         }
 
         if (!isAllowedFile(file.name, file.type)) {
-            return NextResponse.json({ error: 'Недопустимый тип файла. Разрешены: PDF, DOC, DOCX, XLS, XLSX, JPG, PNG' }, { status: 400 });
+            return apiError('Недопустимый тип файла. Разрешены: PDF, DOC, DOCX, XLS, XLSX, JPG, PNG', 400);
         }
 
         // Sanitize filename: only keep extension, generate safe name
@@ -88,7 +91,7 @@ export async function POST(
         // Ensure path doesn't escape upload dir
         const resolvedDir = path.resolve(clientDir);
         if (!resolvedDir.startsWith(path.resolve(UPLOAD_DIR))) {
-            return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
+            return apiError('Invalid path', 400);
         }
 
         await mkdir(clientDir, { recursive: true });
@@ -106,8 +109,8 @@ export async function POST(
 
         const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
         return NextResponse.json(doc, { status: 201 });
-    } catch (error) {
-        console.error('Upload error:', error);
-        return NextResponse.json({ error: 'Failed to upload document' }, { status: 500 });
+    } catch (err) {
+        logger.error('Upload error', { error: String(err) });
+        return apiError('Failed to upload document', 500);
     }
 }

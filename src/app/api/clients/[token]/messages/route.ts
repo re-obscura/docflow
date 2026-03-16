@@ -1,13 +1,14 @@
 import { getDb } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
-import { isValidToken, sanitizeText, sanitizeString, checkRateLimit, requireAdmin } from '@/lib/security';
+import { isValidToken, sanitizeText, sanitizeString, checkRateLimit, requireAdmin, isAllowedFile } from '@/lib/security';
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import { isAllowedFile } from '@/lib/security';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
+import { MAX_FILE_SIZE } from '@/lib/constants';
 
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
 export async function GET(
     request: NextRequest,
@@ -16,18 +17,19 @@ export async function GET(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
         const messages = db.prepare('SELECT * FROM messages WHERE client_id = ? ORDER BY created_at ASC').all(client.id);
         return NextResponse.json(messages);
-    } catch {
-        return NextResponse.json({ error: 'Failed to fetch messages' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to fetch messages', { error: String(err) });
+        return apiError('Failed to fetch messages', 500);
     }
 }
 
@@ -38,12 +40,12 @@ export async function POST(
     try {
         const { token } = await params;
         if (!isValidToken(token)) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+            return apiError('Invalid token', 400);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`msg:${token}:${ip}`, 30, 60000)) {
-            return NextResponse.json({ error: 'Слишком много сообщений. Попробуйте позже.' }, { status: 429 });
+            return apiError('Слишком много сообщений. Попробуйте позже.', 429);
         }
 
         const contentType = request.headers.get('content-type') || '';
@@ -56,9 +58,9 @@ export async function POST(
         let attachmentSize = 0;
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         if (contentType.includes('multipart/form-data')) {
@@ -70,7 +72,7 @@ export async function POST(
 
             if (senderField === 'admin') {
                 if (!requireAdmin(request.headers.get('authorization'))) {
-                    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+                    return apiError('Unauthorized', 401);
                 }
                 senderValue = 'admin';
             }
@@ -78,16 +80,16 @@ export async function POST(
             const file = formData.get('file') as File | null;
             if (file && file.size > 0) {
                 if (file.size > MAX_FILE_SIZE) {
-                    return NextResponse.json({ error: 'Файл слишком большой (макс. 50 МБ)' }, { status: 400 });
+                    return apiError('Файл слишком большой (макс. 50 МБ)', 400);
                 }
                 if (!isAllowedFile(file.name, file.type)) {
-                    return NextResponse.json({ error: 'Недопустимый тип файла' }, { status: 400 });
+                    return apiError('Недопустимый тип файла', 400);
                 }
 
                 const clientDir = path.join(UPLOAD_DIR, String(client.id), 'chat');
                 await mkdir(clientDir, { recursive: true });
 
-                const ext = path.extname(file.name) || '';
+                const ext = path.extname(file.name).toLowerCase().replace(/[^a-z0-9.]/g, '');
                 const filename = `${randomUUID()}${ext}`;
                 const buffer = Buffer.from(await file.arrayBuffer());
                 await writeFile(path.join(clientDir, filename), buffer);
@@ -99,7 +101,7 @@ export async function POST(
             }
 
             if (!text && !attachmentFilename) {
-                return NextResponse.json({ error: 'Введите текст или прикрепите файл' }, { status: 400 });
+                return apiError('Введите текст или прикрепите файл', 400);
             }
         } else {
             // JSON body (backward compat)
@@ -109,13 +111,13 @@ export async function POST(
 
             if (body.sender === 'admin') {
                 if (!requireAdmin(request.headers.get('authorization'))) {
-                    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+                    return apiError('Unauthorized', 401);
                 }
                 senderValue = 'admin';
             }
 
             if (!text) {
-                return NextResponse.json({ error: 'Текст сообщения обязателен' }, { status: 400 });
+                return apiError('Текст сообщения обязателен', 400);
             }
         }
 
@@ -126,7 +128,8 @@ export async function POST(
 
         const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(result.lastInsertRowid);
         return NextResponse.json(message, { status: 201 });
-    } catch {
-        return NextResponse.json({ error: 'Failed to send message' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to send message', { error: String(err) });
+        return apiError('Failed to send message', 500);
     }
 }

@@ -139,6 +139,11 @@ export function createTables(db: Database.Database) {
       details TEXT DEFAULT '',
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      token TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   // ─── Migrations for existing databases ───

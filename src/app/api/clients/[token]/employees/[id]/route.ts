@@ -2,6 +2,8 @@ import { getDb } from '@/lib/db';
 import { NextRequest, NextResponse } from 'next/server';
 import { isValidToken, sanitizeString, checkRateLimit, hashPassword } from '@/lib/security';
 import { logAudit } from '@/lib/audit';
+import { logger } from '@/lib/logger';
+import { getClientByToken, apiError } from '@/lib/helpers';
 
 export async function PUT(
     request: NextRequest,
@@ -10,18 +12,18 @@ export async function PUT(
     try {
         const { token, id } = await params;
         if (!isValidToken(token) || isNaN(Number(id))) {
-            return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+            return apiError('Invalid parameters', 400);
         }
 
         const ip = request.headers.get('x-forwarded-for') || 'unknown';
         if (!checkRateLimit(`emp:${token}:${ip}`, 20, 60000)) {
-            return NextResponse.json({ error: 'Слишком много запросов' }, { status: 429 });
+            return apiError('Слишком много запросов', 429);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const body = await request.json();
@@ -52,11 +54,12 @@ export async function PUT(
 
         const employee = db.prepare('SELECT id, client_id, full_name, position, phone, email, created_at FROM employees WHERE id = ? AND client_id = ?').get(Number(id), client.id);
         if (!employee) {
-            return NextResponse.json({ error: 'Employee not found' }, { status: 404 });
+            return apiError('Employee not found', 404);
         }
         return NextResponse.json(employee);
-    } catch {
-        return NextResponse.json({ error: 'Failed to update employee' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to update employee', { error: String(err) });
+        return apiError('Failed to update employee', 500);
     }
 }
 
@@ -67,13 +70,13 @@ export async function DELETE(
     try {
         const { token, id } = await params;
         if (!isValidToken(token) || isNaN(Number(id))) {
-            return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+            return apiError('Invalid parameters', 400);
         }
 
         const db = getDb();
-        const client = db.prepare('SELECT id FROM clients WHERE token = ?').get(token) as { id: number } | undefined;
+        const client = getClientByToken(db, token);
         if (!client) {
-            return NextResponse.json({ error: 'Client not found' }, { status: 404 });
+            return apiError('Client not found', 404);
         }
 
         const emp = db.prepare('SELECT full_name FROM employees WHERE id = ? AND client_id = ?').get(Number(id), client.id) as { full_name: string } | undefined;
@@ -81,7 +84,8 @@ export async function DELETE(
         logAudit(client.id, emp?.full_name || '', 'employee', 'Удалён сотрудник', 'employee', Number(id));
 
         return NextResponse.json({ success: true });
-    } catch {
-        return NextResponse.json({ error: 'Failed to delete employee' }, { status: 500 });
+    } catch (err) {
+        logger.error('Failed to delete employee', { error: String(err) });
+        return apiError('Failed to delete employee', 500);
     }
 }
